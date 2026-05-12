@@ -78,6 +78,18 @@ static peer_t* peerByRuntimeId(int rid) {
     return nullptr;
 }
 
+static peer_t* peerById(int id) {
+    for (auto& p : s_peers) if (p.id == id) return &p;
+    return nullptr;
+}
+
+/* Global TCP gate — `s.tcp.enable`. When false, all peer connections
+ * are torn down regardless of per-peer enable. Tearing down + bringing
+ * back up reconnects to rnsd as a side effect (each peer's
+ * net_handle close → rnsd_handle close → rnsd.deregister_interface;
+ * next dial re-registers a fresh iface). */
+static bool s_globalEnable = true;
+
 /* ─────────────── HDLC ─────────────── */
 
 /* Write HDLC-framed packet to net handle. Returns true if all bytes sent. */
@@ -321,8 +333,10 @@ static void servicePeers(void)
 {
     TickType_t now = xTaskGetTickCount();
     for (auto& p : s_peers) {
-        if (!p.enabled) {
-            if (p.state == PS_UP || p.state == PS_CONNECTING) disconnectPeer(p, "disabled");
+        bool should_be_up = s_globalEnable && p.enabled;
+        if (!should_be_up) {
+            if (p.state == PS_UP || p.state == PS_CONNECTING)
+                disconnectPeer(p, s_globalEnable ? "disabled" : "tcp stopped");
             continue;
         }
         if (p.state == PS_IDLE || p.state == PS_BACKOFF) {
@@ -408,29 +422,260 @@ static void reloadPeers(void) {
     s_peers = std::move(next);
 }
 
+/* ─────────────── command handlers (sentinels) ───────────────
+ *
+ * Subscriptions are installed in tcpTaskMain so callbacks run on the
+ * tcp task — same task that owns s_peers and reaches into mailbox
+ * state. Each handler clears its sentinel at the end and ignores the
+ * self-unset re-fire (val=""), same pattern as lxmf's cmd handlers. */
+
+static void onGlobalEnableChange(const char* /*key*/, const char* val)
+{
+    bool enabled = !val || std::atoi(val) != 0;   /* missing/empty → on */
+    if (enabled == s_globalEnable) return;
+    s_globalEnable = enabled;
+    info("tcp: globally %s", s_globalEnable ? "enabled" : "disabled");
+    s_configDirty = true;
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+static void onCmdConnect(const char* key, const char* val)
+{
+    if (!val || !*val) return;   /* self-unset re-fire */
+    int n = std::atoi(val);
+    storageUnset(key);
+    peer_t* p = peerById(n);
+    if (!p) { warn("tcp connect: no peer at slot %d", n); return; }
+    if (p->state == PS_UP || p->state == PS_CONNECTING)
+        disconnectPeer(*p, "reconnect");
+    p->cur_backoff_s     = 0;
+    p->next_attempt_tick = xTaskGetTickCount();
+    p->state             = PS_IDLE;
+    info("tcp: connect %d (%s:%u)", n, p->host, (unsigned)p->port);
+    /* attemptConnect runs from servicePeers; let the main loop do it
+     * on its next tick so all peer state transitions go through the
+     * same path. */
+    s_configDirty = true;
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+static void onCmdDisconnect(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    int n = std::atoi(val);
+    storageUnset(key);
+    peer_t* p = peerById(n);
+    if (!p) { warn("tcp disconnect: no peer at slot %d", n); return; }
+    if (p->state == PS_UP || p->state == PS_CONNECTING) {
+        info("tcp: disconnect %d (%s:%u)", n, p->host, (unsigned)p->port);
+        disconnectPeer(*p, "user");
+    } else {
+        cliPrintf("(slot %d already not connected)\n", n);
+    }
+}
+
+static void onCmdRestart(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    storageUnset(key);
+    info("tcp: restart — tearing down all peer connections");
+    for (auto& p : s_peers) {
+        if (p.state == PS_UP || p.state == PS_CONNECTING)
+            disconnectPeer(p, "restart");
+        p.cur_backoff_s     = 0;
+        p.next_attempt_tick = xTaskGetTickCount();
+        p.state             = PS_IDLE;
+    }
+    /* servicePeers redials enabled peers on next tick. */
+    s_configDirty = true;
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
 /* ─────────────── CLI ─────────────── */
 
-static void cliRnsdTcp(const char* args)
-{
-    if (args && strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s TCP peer status\n", CLI_HELP_COL, "rnsd tcp");
-        return;
+static const char* peerStateName(peer_state_t s) {
+    switch (s) {
+        case PS_IDLE:       return "idle";
+        case PS_CONNECTING: return "connecting";
+        case PS_UP:         return "up";
+        case PS_BACKOFF:    return "backoff";
     }
+    return "?";
+}
+
+static void cliTcpStatus(void)
+{
+    cliPrintf("global: %s\n", s_globalEnable ? "enabled" : "disabled");
     if (s_peers.empty()) { cliPrintf("(no peers configured)\n"); return; }
+    cliPrintf("  %-3s %-10s %-32s %-9s %s\n",
+              "#", "state", "host:port", "per-peer", "rx/tx");
     for (auto& p : s_peers) {
-        const char* st = "idle";
-        switch (p.state) {
-            case PS_IDLE: st = "idle"; break;
-            case PS_CONNECTING: st = "connecting"; break;
-            case PS_UP: st = "up"; break;
-            case PS_BACKOFF: st = "backoff"; break;
-        }
-        cliPrintf("[%d] %s %s:%u  state=%s  rx=%llu  tx=%llu\n",
-                  p.id, p.enabled ? "enabled" : "disabled",
-                  p.host[0] ? p.host : "(empty)", (unsigned)p.port, st,
+        char hp[80];
+        std::snprintf(hp, sizeof(hp), "%s:%u",
+                      p.host[0] ? p.host : "(empty)", (unsigned)p.port);
+        cliPrintf("  %-3d %-10s %-32s %-9s rx=%llu tx=%llu\n",
+                  p.id, peerStateName(p.state), hp,
+                  p.enabled ? "enabled" : "disabled",
                   (unsigned long long)p.bytes_in,
                   (unsigned long long)p.bytes_out);
     }
+}
+
+static void cliTcpPeerAdd(const char* rest)
+{
+    while (*rest == ' ') rest++;
+    if (!*rest) { cliPrintf("usage: tcp peer add <host[:port]> [mode]\n"); return; }
+    const char* sp = std::strchr(rest, ' ');
+    std::string hp = sp ? std::string(rest, sp - rest) : std::string(rest);
+    const char* mode = sp ? sp + 1 : "gateway";
+    while (*mode == ' ') mode++;
+    if (!*mode) mode = "gateway";
+
+    /* Split host:port. ':' from the right so IPv6-ish forms could be
+     * extended later; for now just simple host:port or bare hostname. */
+    std::string host;
+    int port = 4965;
+    auto colon = hp.rfind(':');
+    if (colon != std::string::npos) {
+        host = hp.substr(0, colon);
+        port = std::atoi(hp.c_str() + colon + 1);
+        if (port <= 0 || port > 65535) {
+            cliPrintf("tcp peer add: bad port in \"%s\"\n", hp.c_str());
+            return;
+        }
+    } else {
+        host = hp;
+    }
+    if (host.empty()) {
+        cliPrintf("tcp peer add: bad host in \"%s\"\n", hp.c_str());
+        return;
+    }
+
+    /* Find the lowest free slot. */
+    int slot = -1;
+    char k[80];
+    for (int i = 0; i < TCP_MAX_PEERS; i++) {
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%d.host", i);
+        if (!storageExists(k)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        cliPrintf("tcp peer add: no free slot (max %d)\n", TCP_MAX_PEERS);
+        return;
+    }
+
+    /* Write atomically; the s.tcp.peers subscription wakes the tcp
+     * task once at storageEnd(). */
+    storageBegin();
+    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.host",   slot); storageSet(k, host.c_str());
+    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.port",   slot); storageSet(k, port);
+    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.mode",   slot); storageSet(k, mode);
+    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.enable", slot); storageSet(k, 1);
+    storageEnd();
+
+    cliPrintf("tcp: added peer at slot %d: %s:%d (mode=%s)\n",
+              slot, host.c_str(), port, mode);
+}
+
+static void cliTcpPeer(const char* rest)
+{
+    while (*rest == ' ') rest++;
+    if (!*rest) {
+        cliPrintf("usage: tcp peer add|rm|enable|disable …\n");
+        return;
+    }
+    const char* sp = std::strchr(rest, ' ');
+    std::string sub = sp ? std::string(rest, sp - rest) : std::string(rest);
+    const char* rest2 = sp ? sp + 1 : "";
+
+    if (sub == "add") { cliTcpPeerAdd(rest2); return; }
+
+    while (*rest2 == ' ') rest2++;
+    if (!*rest2) {
+        cliPrintf("usage: tcp peer %s <slot>\n", sub.c_str());
+        return;
+    }
+    char* end = nullptr;
+    long n = std::strtol(rest2, &end, 10);
+    if (!end || *end != '\0' || n < 0 || n >= TCP_MAX_PEERS) {
+        cliPrintf("tcp peer %s: bad slot \"%s\"\n", sub.c_str(), rest2);
+        return;
+    }
+    char k[80];
+    std::snprintf(k, sizeof(k), "s.tcp.peers.%ld.host", n);
+    if (!storageExists(k)) {
+        cliPrintf("tcp peer %s: no peer at slot %ld\n", sub.c_str(), n);
+        return;
+    }
+
+    if (sub == "rm") {
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n);
+        storageDeleteTree(k);
+        cliPrintf("tcp: removed peer slot %ld\n", n);
+        return;
+    }
+    if (sub == "enable") {
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld.enable", n);
+        storageSet(k, 1);
+        cliPrintf("tcp: peer %ld enabled\n", n);
+        return;
+    }
+    if (sub == "disable") {
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld.enable", n);
+        storageSet(k, 0);
+        cliPrintf("tcp: peer %ld disabled\n", n);
+        return;
+    }
+    cliPrintf("unknown peer subcommand `%s`. try `tcp help`.\n", sub.c_str());
+}
+
+static void cliTcp(const char* args)
+{
+    if (!args) args = "";
+    while (*args == ' ') args++;
+
+    if (!*args) { cliTcpStatus(); return; }
+
+    if (std::strcmp(args, "help") == 0) {
+        cliPrintf("usage:\n");
+        cliPrintf("  tcp                              list peers + status\n");
+        cliPrintf("  tcp start | stop | restart       global gate (s.tcp.enable)\n");
+        cliPrintf("  tcp connect <slot>               force-connect peer (clear backoff)\n");
+        cliPrintf("  tcp disconnect <slot>            kick peer's connection\n");
+        cliPrintf("  tcp peer add <host[:port]> [mode]\n");
+        cliPrintf("                                   add a peer (port=4965, mode=gateway)\n");
+        cliPrintf("  tcp peer rm <slot>               remove peer slot\n");
+        cliPrintf("  tcp peer enable <slot>           persistently enable\n");
+        cliPrintf("  tcp peer disable <slot>          persistently disable\n");
+        return;
+    }
+
+    const char* sp = std::strchr(args, ' ');
+    std::string verb = sp ? std::string(args, sp - args) : std::string(args);
+    const char* rest = sp ? sp + 1 : "";
+
+    if (verb == "start")      { storageSet("s.tcp.enable", 1); cliPrintf("tcp: started\n"); return; }
+    if (verb == "stop")       { storageSet("s.tcp.enable", 0); cliPrintf("tcp: stopped\n"); return; }
+    if (verb == "restart")    { storageSet("tcp.cmd.restart",    1); cliPrintf("tcp: restart requested\n"); return; }
+
+    if (verb == "connect" || verb == "disconnect") {
+        while (*rest == ' ') rest++;
+        if (!*rest) { cliPrintf("usage: tcp %s <slot>\n", verb.c_str()); return; }
+        char* end = nullptr;
+        long n = std::strtol(rest, &end, 10);
+        if (!end || *end != '\0' || n < 0 || n >= TCP_MAX_PEERS) {
+            cliPrintf("tcp %s: bad slot \"%s\"\n", verb.c_str(), rest);
+            return;
+        }
+        const char* sentinel = (verb == "connect") ? "tcp.cmd.connect"
+                                                   : "tcp.cmd.disconnect";
+        storageSet(sentinel, (int)n);
+        cliPrintf("tcp: %s %ld requested\n", verb.c_str(), n);
+        return;
+    }
+
+    if (verb == "peer") { cliTcpPeer(rest); return; }
+
+    cliPrintf("unknown subcommand `%s`. try `tcp help`.\n", verb.c_str());
 }
 
 /* ─────────────── Task ─────────────── */
@@ -441,7 +686,15 @@ static void tcpTaskMain(void*)
 
     itsClientInit(TCP_MAX_PEERS * 2);
 
-    storageSubscribeChanges("s.tcp.peers", onCfgChange);
+    /* Cache the global gate. Default 1 — no key in storage means "on";
+     * user must explicitly set s.tcp.enable=0 to stop. */
+    s_globalEnable = storageGetInt("s.tcp.enable", 1) != 0;
+
+    storageSubscribeChanges("s.tcp.peers",        onCfgChange);
+    storageSubscribeChanges("s.tcp.enable",       onGlobalEnableChange);
+    storageSubscribeChanges("tcp.cmd.connect",    onCmdConnect);
+    storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
+    storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
 
     for (;;) {
         if (s_configDirty) { s_configDirty = false; reloadPeers(); }
@@ -460,7 +713,7 @@ void tcpInit(void)
         storageSet("s.tcp.version", TCP_VERSION);
     }
 
-    cliRegisterCmd("rnsd tcp", cliRnsdTcp);
+    cliRegisterCmd("tcp", cliTcp);
 
     /* Core 0 alongside net + rnsd, prio 2, PSRAM stack. */
     s_task = spawnTask(tcpTaskMain, TAG, 6144, nullptr, 2, 0, STACK_PSRAM);
