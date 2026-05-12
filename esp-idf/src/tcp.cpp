@@ -4,7 +4,7 @@
  * Phase 1 scope: outbound side only. Watches s.tcp.peers[] and for each
  * enabled peer:
  *   1. Dials via net's NET_PORT_TCP_DIAL with "host:port" payload.
- *   2. On success, registers with rnsd via RNSD_PORT_REGISTER as
+ *   2. On success, registers with rnsd via RNSD_PORT_TRANSPORT as
  *      iface "tcp/<id>".
  *   3. Shuttles bytes both ways with HDLC framing on the net handle
  *      (FLAG=0x7E, ESC=0x7D, ESC_MASK=0x20).
@@ -276,7 +276,7 @@ static void attemptConnect(peer_t& p)
         return;
     }
 
-    rnsd_register_t reg = {};
+    rnsd_transport_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp/%d", p.id);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 0;        /* TCP is variable */
@@ -285,7 +285,7 @@ static void attemptConnect(peer_t& p)
     reg.fwd = (p.mode == RNS_IFACE_MODE_GATEWAY || p.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
     reg.rpt = 0;
 
-    p.rnsd_handle = itsConnect("rnsd", RNSD_PORT_REGISTER, &reg, sizeof(reg),
+    p.rnsd_handle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
                                pdMS_TO_TICKS(500), p.runtime_id, onRnsdRecv, onRnsdDisconnect);
     if (p.rnsd_handle < 0) {
         warn("peer[%d] rnsd register failed", p.id);
