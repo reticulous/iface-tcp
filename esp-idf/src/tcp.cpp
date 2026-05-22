@@ -705,6 +705,24 @@ static void tcpTaskMain(void*)
     }
 }
 
+#if CONFIG_DIPTYCH_LCD
+#include "lcd.h"
+/* Settings → Reticulum → Transports → TCP. The outbound peer list is an array
+ * editor (add/remove/per-peer host+port) — that stays in the web UI for now,
+ * like the WiFi known-networks list; here we surface the live peer states. */
+static void tcpSettingsPane(void* arg) {
+    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
+    lcdSettingSection(p, "TCP peers");
+    lcdSettingValue  (p, "Peer 0", "tcp.peers.0.state");
+    lcdSettingValue  (p, "Peer 1", "tcp.peers.1.state");
+    lcdSettingValue  (p, "Peer 2", "tcp.peers.2.state");
+    lcdSettingValue  (p, "Peer 3", "tcp.peers.3.state");
+    lv_obj_t* note = lv_label_create(p);
+    lv_label_set_text(note, "Add / edit peers in the web UI.");
+    lv_obj_set_style_text_color(note, lv_color_hex(0x8a93a0), 0);
+}
+#endif
+
 void tcpInit(void)
 {
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
@@ -712,6 +730,10 @@ void tcpInit(void)
         storageDefault("s.tcp.server_port", 4965);
         storageSet("s.tcp.version", TCP_VERSION);
     }
+
+#if CONFIG_DIPTYCH_LCD
+    lcdRegisterSettings("Reticulum/Transports/TCP", "TCP", tcpSettingsPane);
+#endif
 
     cliRegisterCmd("tcp", cliTcp);
 
