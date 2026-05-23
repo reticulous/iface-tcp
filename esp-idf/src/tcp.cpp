@@ -90,6 +90,18 @@ static peer_t* peerById(int id) {
  * next dial re-registers a fresh iface). */
 static bool s_globalEnable = true;
 
+/* Net-up gate. A peer can only dial while WiFi is actually up. Dialing
+ * with net down is pointless — net rejects the dial (`!netIsStaConnected`)
+ * — and the doomed attempt still spends a connect/teardown cycle, logs,
+ * and cycles the rnsd iface register/deregister path. Worse, it keeps the
+ * tcp task waking on backoff deadlines that can never succeed, defeating
+ * light sleep when off-WiFi. We track net via NET_EV_UP/DOWN and only
+ * attempt connects while up; on net-down peers are torn down once here,
+ * on net-up backoff is cleared so they redial promptly. Written from the
+ * net task (edge events) and read on the tcp task — volatile, single-word. */
+static volatile bool s_netUp   = false;
+static volatile bool s_netEdge = false;   /* net just came up — clear backoff, redial now */
+
 /* ─────────────── HDLC ─────────────── */
 
 /* Write HDLC-framed packet to net handle. Returns true if all bytes sent. */
@@ -273,7 +285,7 @@ static void onRnsdDisconnect(int ref) {
 
 static void attemptConnect(peer_t& p)
 {
-    if (!p.enabled || p.host[0] == '\0' || p.port == 0) return;
+    if (!p.enabled || !s_netUp || p.host[0] == '\0' || p.port == 0) return;
 
     p.state = PS_CONNECTING;
     publishPeerState(p);
@@ -315,6 +327,10 @@ static void attemptConnect(peer_t& p)
 
 static TickType_t nextDeadline(void)
 {
+    /* Net down → nothing dials; sleep until net-up / config / cmd notify
+     * wakes us. No 1 Hz stats churn either: peer state is static while off
+     * WiFi, so the chip can stay in light sleep. */
+    if (!s_netUp) return portMAX_DELAY;
     TickType_t now = xTaskGetTickCount();
     TickType_t soonest = portMAX_DELAY;
     for (auto& p : s_peers) {
@@ -333,10 +349,12 @@ static void servicePeers(void)
 {
     TickType_t now = xTaskGetTickCount();
     for (auto& p : s_peers) {
-        bool should_be_up = s_globalEnable && p.enabled;
+        bool should_be_up = s_globalEnable && p.enabled && s_netUp;
         if (!should_be_up) {
             if (p.state == PS_UP || p.state == PS_CONNECTING)
-                disconnectPeer(p, s_globalEnable ? "disabled" : "tcp stopped");
+                disconnectPeer(p, !s_netUp        ? "net down"
+                                : !s_globalEnable ? "tcp stopped"
+                                                  : "disabled");
             continue;
         }
         if (p.state == PS_IDLE || p.state == PS_BACKOFF) {
@@ -505,7 +523,8 @@ static const char* peerStateName(peer_state_t s) {
 
 static void cliTcpStatus(void)
 {
-    cliPrintf("global: %s\n", s_globalEnable ? "enabled" : "disabled");
+    cliPrintf("global: %s%s\n", s_globalEnable ? "enabled" : "disabled",
+              (s_globalEnable && !s_netUp) ? " (waiting for net)" : "");
     if (s_peers.empty()) { cliPrintf("(no peers configured)\n"); return; }
     cliPrintf("  %-3s %-10s %-32s %-9s %s\n",
               "#", "state", "host:port", "per-peer", "rx/tx");
@@ -678,6 +697,28 @@ static void cliTcp(const char* args)
     cliPrintf("unknown subcommand `%s`. try `tcp help`.\n", verb.c_str());
 }
 
+/* ─────────────── net events ───────────────
+ *
+ * Run on the net task (DOWN edge) or, for the level-replayed UP edge,
+ * possibly on the tcp task at registration time. Both only flip volatile
+ * flags + notify — the reconcile (tear-down / redial) happens on the tcp
+ * task in servicePeers, which alone owns s_peers. */
+
+static void onNetUp(const char*)
+{
+    if (s_netUp) return;
+    s_netUp   = true;
+    s_netEdge = true;          /* clear backoff so peers dial without delay */
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+static void onNetDown(const char*)
+{
+    if (!s_netUp) return;
+    s_netUp = false;
+    if (s_task) xTaskNotifyGive(s_task);   /* servicePeers tears peers down */
+}
+
 /* ─────────────── Task ─────────────── */
 
 static void tcpTaskMain(void*)
@@ -690,6 +731,13 @@ static void tcpTaskMain(void*)
      * user must explicitly set s.tcp.enable=0 to stop. */
     s_globalEnable = storageGetInt("s.tcp.enable", 1) != 0;
 
+    /* Seed net state, then subscribe. NET_EV_UP is level-replayed, so if
+     * WiFi is already up onNetUp fires immediately (and no-ops since we
+     * seeded s_netUp). */
+    s_netUp = netIsUp();
+    netRegister(NET_EV_UP,   onNetUp);
+    netRegister(NET_EV_DOWN, onNetDown);
+
     storageSubscribeChanges("s.tcp.peers",        onCfgChange);
     storageSubscribeChanges("s.tcp.enable",       onGlobalEnableChange);
     storageSubscribeChanges("tcp.cmd.connect",    onCmdConnect);
@@ -698,6 +746,20 @@ static void tcpTaskMain(void*)
 
     for (;;) {
         if (s_configDirty) { s_configDirty = false; reloadPeers(); }
+
+        if (s_netEdge) {
+            s_netEdge = false;
+            /* WiFi just returned — drop backoff accrued while down so
+             * enabled peers redial on this tick instead of waiting it out. */
+            TickType_t now = xTaskGetTickCount();
+            for (auto& p : s_peers) {
+                if (p.state == PS_IDLE || p.state == PS_BACKOFF) {
+                    p.cur_backoff_s     = 0;
+                    p.next_attempt_tick = now;
+                }
+            }
+        }
+
         servicePeers();
         for (auto& p : s_peers) publishPeerState(p);
 
