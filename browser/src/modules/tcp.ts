@@ -1,4 +1,4 @@
-import { useMenuStore } from 'diptych-browser/stores/menu'
+import { useMenuStore } from 'spangap-browser/stores/menu'
 import TcpPanel from '../panels/TcpPanel.vue'
 
 export function registerTcp() {

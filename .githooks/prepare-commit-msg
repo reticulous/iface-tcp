@@ -1,0 +1,36 @@
+#!/bin/sh
+# DCO sign-off auto-injection.
+#
+# Appends `Signed-off-by: <user.name> <user.email>` to the commit message
+# if no such trailer is present. Enabled per-clone via:
+#
+#     git config core.hooksPath .githooks
+#
+# See CONTRIBUTING.md.
+
+commit_msg_file=$1
+commit_source=$2
+
+# Skip when git is composing the message from an existing commit:
+#   merge   — merge commit, sign-off belongs in merged content
+#   squash  — squash, sign-offs already in the squashed commits
+#   commit  — amending / cherry-picking, preserve existing trailers
+case "$commit_source" in
+    merge|squash|commit) exit 0 ;;
+esac
+
+# Already signed off? Nothing to do.
+if grep -qE '^Signed-off-by: ' "$commit_msg_file"; then
+    exit 0
+fi
+
+name=$(git config user.name)
+email=$(git config user.email)
+if [ -z "$name" ] || [ -z "$email" ]; then
+    echo "warning: user.name and user.email must be set to auto sign off" >&2
+    exit 0
+fi
+
+git interpret-trailers --in-place \
+    --trailer "Signed-off-by: $name <$email>" \
+    "$commit_msg_file"

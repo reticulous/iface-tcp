@@ -14,7 +14,8 @@
  * Phase 5 (config-disabled by default per the plan §16).
  */
 #include "tcp.h"
-#include "diptych.h"
+#include "spangap.h"
+#include "net.h"          /* netRegister, netIsUp, NET_EV_*, NET_PORT_TCP_DIAL */
 #include "ports.h"
 
 #include "freertos/FreeRTOS.h"
@@ -767,7 +768,7 @@ static void tcpTaskMain(void*)
     }
 }
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 #include "lcd.h"
 /* Settings → Reticulum → Transports → TCP. The outbound peer list is an array
  * editor (add/remove/per-peer host+port) — that stays in the web UI for now,
@@ -793,7 +794,7 @@ void tcpInit(void)
         storageSet("s.tcp.version", TCP_VERSION);
     }
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
     lcdRegisterSettings("Reticulum/Transports/TCP", "TCP", tcpSettingsPane);
 #endif
 

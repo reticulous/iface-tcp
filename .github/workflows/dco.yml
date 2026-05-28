@@ -1,0 +1,54 @@
+name: DCO
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  check:
+    name: Sign-off check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on every new commit
+        run: |
+          set -eu
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.event.after }}"
+            # New branch or first push: walk back to the initial commit.
+            if [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-list --max-parents=0 "$head" | tail -1)"
+            fi
+            # Branch deletion: nothing to check.
+            if [ "$head" = "0000000000000000000000000000000000000000" ]; then
+              echo "Branch deletion event — nothing to check."
+              exit 0
+            fi
+          fi
+
+          failed=0
+          for commit in $(git rev-list "$base..$head"); do
+            if ! git log -1 --format=%B "$commit" \
+                | grep -qE '^Signed-off-by: .+ <.+@.+\..+>$'; then
+              echo "::error::commit $commit lacks a Signed-off-by trailer"
+              git log -1 --format='   %h %an <%ae>: %s' "$commit"
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo
+            echo "Every commit must carry a Signed-off-by trailer."
+            echo "See CONTRIBUTING.md for the DCO requirement and how to amend."
+            exit 1
+          fi

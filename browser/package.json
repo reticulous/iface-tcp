@@ -1,33 +1,17 @@
 {
-  "name": "reticulous-web",
+  "name": "reticulous-tcp",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "quasar dev",
-    "build": "quasar build",
-    "deploy": "bash deploy.sh"
+  "description": "Browser-side TCP transport settings panel for reticulous.",
+  "license": "Apache-2.0",
+  "exports": {
+    "./modules/*": "./src/modules/*.ts",
+    "./panels/*.vue": "./src/panels/*.vue"
   },
-  "dependencies": {
-    "diptych-browser": "file:../../diptych/browser",
-    "@quasar/extras": "^1.17.0",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
-    "pinia": "^3.0.4",
-    "quasar": "^2.17.0",
-    "register-service-worker": "^1.7.2",
+  "peerDependencies": {
     "vue": "^3.5.0",
-    "vue-router": "^4.4.0",
-    "workbox-precaching": "^7.4.0",
-    "workbox-routing": "^7.4.0",
-    "workbox-strategies": "^7.4.0"
-  },
-  "devDependencies": {
-    "@quasar/app-vite": "^2.1.0",
-    "@types/ws": "^8.18.1",
-    "tsx": "^4.21.0",
-    "typescript": "^5.7.0",
-    "workbox-build": "^7.4.0",
-    "vite": "^7.0.0"
+    "quasar": "^2.17.0",
+    "pinia": "^3.0.4",
+    "spangap-browser": "*"
   }
 }
