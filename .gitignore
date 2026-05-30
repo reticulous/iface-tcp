@@ -28,3 +28,6 @@ staging/
 
 # Auto-generated artifacts (added by maintenance sweep)
 *.pyo
+
+# Generated browser/npm artifacts (regenerated each build)
+**/package-lock.json
