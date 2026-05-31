@@ -2,14 +2,14 @@ import { useMenuStore } from 'spangap-browser/stores/menu'
 import TcpPanel from '../panels/TcpPanel.vue'
 
 export function registerTcp() {
-  useMenuStore().register('settings', 'Settings', 10, [
+  useMenuStore().register('settings', 'Settings', [
     {
-      id: 'reticulum', label: 'Reticulum', type: 'submenu', order: 30,
+      id: 'reticulum', label: 'Reticulum', type: 'submenu',
       children: [
         {
-          id: 'reticulum.transports', label: 'Transports', type: 'submenu', order: 20,
+          id: 'reticulum.transports', label: 'Transports', type: 'submenu',
           children: [
-            { id: 'reticulum.transports.tcp', label: 'TCP', type: 'panel', order: 10,
+            { id: 'reticulum.transports.tcp', label: 'TCP', type: 'panel',
               component: TcpPanel },
           ],
         },
