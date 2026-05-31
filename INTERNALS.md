@@ -1,4 +1,4 @@
-# reticulous-tcp — internals
+# tr-tcp — internals
 
 ## Task
 

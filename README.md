@@ -1,9 +1,9 @@
-# reticulous-tcp
+# tr-tcp
 
 ## What is this?
 
-**reticulous-tcp** is the RNS-over-TCP transport for
-[reticulous-core](../reticulous-core). It opens outbound TCP dials to
+**tr-tcp** is the RNS-over-TCP transport for
+[rns](../rns). It opens outbound TCP dials to
 configured peers (via `spangap-net`'s `NET_PORT_TCP_DIAL`) and accepts
 inbound listens, frames RNS packets with HDLC byte-stuffing on the
 wire, and registers each peer as its own interface with `rnsd` through
@@ -12,7 +12,7 @@ wire, and registers each peer as its own interface with `rnsd` through
 ## What this straddle owns
 
 ```
-reticulous-tcp/
+tr-tcp/
 ├── esp-idf/
 │   ├── include/tcp.h
 │   └── src/tcp.cpp        the tcp transport task
@@ -40,12 +40,12 @@ Each peer registers as its own interface with rnsd; the iface name is
 
 ## Dependencies
 
-- [reticulous-core](../reticulous-core) — protocol core.
+- [rns](../rns) — protocol core.
 - [spangap-net](../../s/spangap-net) — TCP dial + listen.
 
 ## Read next
 
 - [INTERNALS.md](INTERNALS.md) — wire framing, reconnect backoff,
   iface lifecycle.
-- The reticulous-tdeck doc:
-  [docs/tcp.md](../reticulous-tdeck/docs/tcp.md).
+- The hw-tdeck doc:
+  [docs/tcp.md](../hw-tdeck/docs/tcp.md).

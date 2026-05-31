@@ -1,6 +1,6 @@
 # License
 
-This repository, **reticulous-tcp** (RNS-over-TCP transport for reticulous),
+This repository, **tr-tcp** (RNS-over-TCP transport for reticulous),
 is released under the **Apache License, Version 2.0**.
 
 Full license text: <https://www.apache.org/licenses/LICENSE-2.0>

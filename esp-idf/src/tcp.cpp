@@ -527,13 +527,13 @@ static void cliTcpStatus(void)
     cliPrintf("global: %s%s\n", s_globalEnable ? "enabled" : "disabled",
               (s_globalEnable && !s_netUp) ? " (waiting for net)" : "");
     if (s_peers.empty()) { cliPrintf("(no peers configured)\n"); return; }
-    cliPrintf("  %-3s %-10s %-32s %-9s %s\n",
+    cliPrintf("%-3s %-10s %-32s %-9s %s\n",
               "#", "state", "host:port", "per-peer", "rx/tx");
     for (auto& p : s_peers) {
         char hp[80];
         std::snprintf(hp, sizeof(hp), "%s:%u",
                       p.host[0] ? p.host : "(empty)", (unsigned)p.port);
-        cliPrintf("  %-3d %-10s %-32s %-9s rx=%llu tx=%llu\n",
+        cliPrintf("%-3d %-10s %-32s %-9s rx=%llu tx=%llu\n",
                   p.id, peerStateName(p.state), hp,
                   p.enabled ? "enabled" : "disabled",
                   (unsigned long long)p.bytes_in,
@@ -645,7 +645,7 @@ static void cliTcpPeer(const char* rest)
         cliPrintf("tcp: peer %ld disabled\n", n);
         return;
     }
-    cliPrintf("unknown peer subcommand `%s`. try `tcp help`.\n", sub.c_str());
+    cliPrintf("unknown peer subcommand `%s`. try `tcp -h`.\n", sub.c_str());
 }
 
 static void cliTcp(const char* args)
@@ -655,17 +655,16 @@ static void cliTcp(const char* args)
 
     if (!*args) { cliTcpStatus(); return; }
 
-    if (std::strcmp(args, "help") == 0) {
-        cliPrintf("usage:\n");
-        cliPrintf("  tcp                              list peers + status\n");
-        cliPrintf("  tcp start | stop | restart       global gate (s.tcp.enable)\n");
-        cliPrintf("  tcp connect <slot>               force-connect peer (clear backoff)\n");
-        cliPrintf("  tcp disconnect <slot>            kick peer's connection\n");
-        cliPrintf("  tcp peer add <host[:port]> [mode]\n");
-        cliPrintf("                                   add a peer (port=4965, mode=gateway)\n");
-        cliPrintf("  tcp peer rm <slot>               remove peer slot\n");
-        cliPrintf("  tcp peer enable <slot>           persistently enable\n");
-        cliPrintf("  tcp peer disable <slot>          persistently disable\n");
+    if (std::strcmp(args, "help") == 0) { cliPrintf("%-*s TCP transport status; peers; start/stop\n", CLI_HELP_COL, "tcp [...]"); return; }
+    if (cliWantsHelp(args)) {
+        cliPrintf("tcp                              list peers + status\n");
+        cliPrintf("tcp start | stop | restart       global gate (s.tcp.enable)\n");
+        cliPrintf("tcp connect <slot>               force-connect peer (clear backoff)\n");
+        cliPrintf("tcp disconnect <slot>            kick peer's connection\n");
+        cliPrintf("tcp peer add <host[:port]> [mode] add a peer (port=4965, mode=gateway)\n");
+        cliPrintf("tcp peer rm <slot>               remove peer slot\n");
+        cliPrintf("tcp peer enable <slot>           persistently enable\n");
+        cliPrintf("tcp peer disable <slot>          persistently disable\n");
         return;
     }
 
@@ -695,7 +694,7 @@ static void cliTcp(const char* args)
 
     if (verb == "peer") { cliTcpPeer(rest); return; }
 
-    cliPrintf("unknown subcommand `%s`. try `tcp help`.\n", verb.c_str());
+    cliPrintf("unknown subcommand `%s`. try `tcp -h`.\n", verb.c_str());
 }
 
 /* ─────────────── net events ───────────────

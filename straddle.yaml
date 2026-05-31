@@ -1,15 +1,15 @@
-# reticulous-tcp — RNS-over-TCP transport for reticulous.
+# tr-tcp — RNS-over-TCP transport for reticulous.
 #
 # Outbound dial (via net's NET_PORT_TCP_DIAL) + inbound listen, HDLC
 # byte-stuffing on the wire. Each peer registers as its own iface with
 # rnsd through RNSD_PORT_TRANSPORT.
 schema_version: 1
-name: reticulous/reticulous-tcp
+name: reticulous/tr-tcp
 prefix: rns_tcp
 version: 0.1.0
 firmware: esp-idf
 browser: browser
 platforms: [idf]
 requires:
-  - reticulous/reticulous-core
+  - reticulous/rns
   - spangap/spangap-net

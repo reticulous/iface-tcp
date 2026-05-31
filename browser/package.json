@@ -1,5 +1,5 @@
 {
-  "name": "reticulous-tcp",
+  "name": "tr-tcp",
   "version": "0.1.0",
   "type": "module",
   "description": "Browser-side TCP transport settings panel for reticulous.",
