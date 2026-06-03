@@ -14,8 +14,7 @@ requires:
   - reticulous/rns
   - spangap/spangap-net
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
-# tcpInit() self-registers with rnsd via ITS, so it sorts after rnsd (order
-# 160) in the transport band.
+# tcpInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
+# rnsd ahead of it in dependency-topo order, so its port surface is up first.
 init:
   - call: tcpInit
-    order: 170
