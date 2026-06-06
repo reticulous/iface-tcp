@@ -73,6 +73,7 @@ struct peer_t {
 static std::vector<peer_t> s_peers;
 static int s_next_runtime_id = 1;
 static TaskHandle_t s_task = nullptr;
+static TickType_t s_nextPublishTick = 0;   /* throttles periodic stats publish to ~1 Hz */
 
 static peer_t* peerByRuntimeId(int rid) {
     for (auto& p : s_peers) if (p.runtime_id == rid) return &p;
@@ -82,6 +83,16 @@ static peer_t* peerByRuntimeId(int rid) {
 static peer_t* peerById(int id) {
     for (auto& p : s_peers) if (p.id == id) return &p;
     return nullptr;
+}
+
+/* A peer is dialable only if enabled AND fully addressed. An enabled peer
+ * with an empty host or zero port can never connect: attemptConnect no-ops
+ * on it (see its guard) without advancing next_attempt_tick or changing
+ * state, so nextDeadline keeps returning 0 and itsPoll never blocks — the
+ * task loop spins, starves IDLE0, and trips the task WDT shortly after boot.
+ * Exclude such peers everywhere we decide to dial or compute the sleep. */
+static inline bool peerDialable(const peer_t& p) {
+    return p.enabled && p.host[0] != '\0' && p.port != 0;
 }
 
 /* Global TCP gate — `s.tcp.enable`. When false, all peer connections
@@ -247,15 +258,18 @@ static peer_t* peerByRnsdHandle(int h) {
 }
 
 static void onNetRecv(int handle, size_t /*bytesAvail*/) {
-    peer_t* p = peerByNetHandle(handle);
-    if (!p) return;
     /* Plain static — ITS dispatches recv callbacks only on the task that
      * registered them (tcp task here), so no concurrency. Avoid
      * `thread_local` which on ESP-IDF/libgcc pulls in lazy TLS init that
      * has been seen to corrupt FreeRTOS scheduler state at boot. */
     static uint8_t buf[1024];
+    /* Always drain first, then decide what to do with it. Returning before
+     * the itsRecv would leave the bytes in the buffer; ITS would keep
+     * redispatching this callback with nothing consumed → busy spin (WDT). */
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
+    peer_t* p = peerByNetHandle(handle);
+    if (!p) return;   /* conn outlived its peer — drop the drained bytes */
     p->bytes_in += n;
     hdlcConsume(p, buf, n);
 }
@@ -266,11 +280,15 @@ static void onNetDisconnect(int ref) {
     disconnectPeer(*p, "net closed");
 }
 static void onRnsdRecv(int handle, size_t /*bytesAvail*/) {
-    peer_t* p = peerByRnsdHandle(handle);
-    if (!p || p->net_handle < 0) return;
     static uint8_t pkt[RNS_MTU + 16];
+    /* Drain first, then decide. rnsd floods this iface with the network's
+     * announce stream; if we returned before itsRecv whenever the net side
+     * is momentarily down, the packet would sit in the buffer and ITS would
+     * redispatch us forever with nothing consumed → busy spin (WDT). */
     size_t n = itsRecv(handle, pkt, sizeof(pkt), 0);
     if (n == 0) return;
+    peer_t* p = peerByRnsdHandle(handle);
+    if (!p || p->net_handle < 0) return;   /* can't forward — drop drained pkt */
     if (!hdlcSend(p->net_handle, pkt, n)) {
         warn("peer[%d] hdlc send failed", p->id);
         return;
@@ -328,14 +346,19 @@ static void attemptConnect(peer_t& p)
 
 static TickType_t nextDeadline(void)
 {
-    /* Net down → nothing dials; sleep until net-up / config / cmd notify
-     * wakes us. No 1 Hz stats churn either: peer state is static while off
-     * WiFi, so the chip can stay in light sleep. */
-    if (!s_netUp) return portMAX_DELAY;
+    /* Nothing dials while WiFi is down OR the global gate is off; sleep until
+     * a net-up / config / enable / cmd notify wakes us (no 1 Hz stats churn
+     * either — peer state is static, so the chip can stay in light sleep).
+     * This MUST match servicePeers' dial gate: if we returned a finite (here
+     * 0) deadline for an enabled peer that servicePeers won't actually dial —
+     * e.g. an idle peer whose attempt tick is already past while the global
+     * gate is off — itsPoll(0) would return instantly every loop, spinning
+     * the task and starving IDLE0 → task WDT. */
+    if (!s_netUp || !s_globalEnable) return portMAX_DELAY;
     TickType_t now = xTaskGetTickCount();
     TickType_t soonest = portMAX_DELAY;
     for (auto& p : s_peers) {
-        if (!p.enabled) continue;
+        if (!peerDialable(p)) continue;
         if (p.state == PS_BACKOFF || p.state == PS_IDLE) {
             TickType_t d = (p.next_attempt_tick > now) ? (p.next_attempt_tick - now) : 0;
             if (d < soonest) soonest = d;
@@ -350,7 +373,7 @@ static void servicePeers(void)
 {
     TickType_t now = xTaskGetTickCount();
     for (auto& p : s_peers) {
-        bool should_be_up = s_globalEnable && p.enabled && s_netUp;
+        bool should_be_up = s_globalEnable && peerDialable(p) && s_netUp;
         if (!should_be_up) {
             if (p.state == PS_UP || p.state == PS_CONNECTING)
                 disconnectPeer(p, !s_netUp        ? "net down"
@@ -761,29 +784,25 @@ static void tcpTaskMain(void*)
         }
 
         servicePeers();
-        for (auto& p : s_peers) publishPeerState(p);
+
+        /* Publish peer stats at ~1 Hz. State transitions already publish
+         * immediately from attemptConnect/disconnectPeer; this periodic pass
+         * only refreshes the tx/rx byte counters. Gating it is essential: a
+         * busy peer makes itsPoll return early on every RX, so publishing
+         * unconditionally re-committed the ever-changing byte counts to
+         * storage on every loop iteration — that churned cJSON nonstop on
+         * CPU0 (tripping the task WDT) and fired change-subscriptions faster
+         * than subscribers could drain them (notify drops). The 1 s cap in
+         * nextDeadline guarantees this still runs even when fully idle. */
+        TickType_t pubNow = xTaskGetTickCount();
+        if ((int32_t)(pubNow - s_nextPublishTick) >= 0) {
+            for (auto& p : s_peers) publishPeerState(p);
+            s_nextPublishTick = pubNow + pdMS_TO_TICKS(1000);
+        }
 
         itsPoll(nextDeadline());
     }
 }
-
-#if CONFIG_SPANGAP_LCD
-#include "lcd.h"
-/* Settings → Reticulum → Transports → TCP. The outbound peer list is an array
- * editor (add/remove/per-peer host+port) — that stays in the web UI for now,
- * like the WiFi known-networks list; here we surface the live peer states. */
-static void tcpSettingsPane(void* arg) {
-    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
-    lcdSettingSection(p, "TCP peers");
-    lcdSettingValue  (p, "Peer 0", "tcp.peers.0.state");
-    lcdSettingValue  (p, "Peer 1", "tcp.peers.1.state");
-    lcdSettingValue  (p, "Peer 2", "tcp.peers.2.state");
-    lcdSettingValue  (p, "Peer 3", "tcp.peers.3.state");
-    lv_obj_t* note = lv_label_create(p);
-    lv_label_set_text(note, "Add / edit peers in the web UI.");
-    lv_obj_set_style_text_color(note, lv_color_hex(0x8a93a0), 0);
-}
-#endif
 
 void tcpInit(void)
 {
@@ -792,10 +811,6 @@ void tcpInit(void)
         storageDefault("s.tcp.server_port", 4965);
         storageSet("s.tcp.version", TCP_VERSION);
     }
-
-#if CONFIG_SPANGAP_LCD
-    lcdRegisterSettings("Reticulum/Transports/TCP", "TCP", tcpSettingsPane);
-#endif
 
     cliRegisterCmd("tcp", cliTcp);
 

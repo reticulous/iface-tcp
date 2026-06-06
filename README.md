@@ -1,8 +1,8 @@
-# tr-tcp
+# iface-tcp
 
 ## What is this?
 
-**tr-tcp** is the RNS-over-TCP transport for
+**iface-tcp** is the RNS-over-TCP transport for
 [rns](../rns). It opens outbound TCP dials to
 configured peers (via `spangap-net`'s `NET_PORT_TCP_DIAL`) and accepts
 inbound listens, frames RNS packets with HDLC byte-stuffing on the
@@ -12,7 +12,7 @@ wire, and registers each peer as its own interface with `rnsd` through
 ## What this straddle owns
 
 ```
-tr-tcp/
+iface-tcp/
 ├── esp-idf/
 │   ├── include/tcp.h
 │   └── src/tcp.cpp        the tcp transport task

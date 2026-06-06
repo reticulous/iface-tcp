@@ -1,10 +1,10 @@
-# tr-tcp — RNS-over-TCP transport for reticulous.
+# iface-tcp — RNS-over-TCP transport for reticulous.
 #
 # Outbound dial (via net's NET_PORT_TCP_DIAL) + inbound listen, HDLC
 # byte-stuffing on the wire. Each peer registers as its own iface with
 # rnsd through RNSD_PORT_TRANSPORT.
 schema_version: 1
-name: reticulous/tr-tcp
+name: reticulous/iface-tcp
 prefix: rns_tcp
 version: 0.1.0
 firmware: esp-idf
@@ -13,8 +13,15 @@ platforms: [idf]
 requires:
   - reticulous/rns
   - spangap/spangap-net
+optional_requires:
+  # On-device TCP settings pane — esp-idf/conditional/spangap-lcd/src/tcp_lcd.cpp,
+  # compiled only when the lcd straddle is staged and registered via the
+  # when:-gated tcpLcdRegister init hook.
+  - spangap/spangap-lcd
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
 # tcpInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
 # rnsd ahead of it in dependency-topo order, so its port surface is up first.
 init:
   - call: tcpInit
+  - call: tcpLcdRegister
+    when: spangap/spangap-lcd

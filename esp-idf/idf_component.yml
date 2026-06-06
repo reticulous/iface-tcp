@@ -1,5 +1,5 @@
-description: "tr-tcp: RNS-over-TCP transport for reticulous (outbound dial + inbound listen, HDLC-framed)."
-url: https://github.com/reticulous/tr-tcp
+description: "iface-tcp: RNS-over-TCP transport for reticulous (outbound dial + inbound listen, HDLC-framed)."
+url: https://github.com/reticulous/iface-tcp
 version: "0.1.0"
 license: "Apache-2.0"
 targets:

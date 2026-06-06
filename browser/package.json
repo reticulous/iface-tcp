@@ -1,5 +1,5 @@
 {
-  "name": "tr-tcp",
+  "name": "iface-tcp",
   "version": "0.1.0",
   "type": "module",
   "description": "Browser-side TCP transport settings panel for reticulous.",
