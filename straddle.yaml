@@ -13,11 +13,6 @@ platforms: [idf]
 requires:
   - reticulous/rns
   - spangap/spangap-net
-optional_requires:
-  # On-device TCP settings pane — esp-idf/conditional/spangap-lcd/src/tcp_lcd.cpp,
-  # compiled only when the lcd straddle is staged and registered via the
-  # when:-gated tcpLcdRegister init hook.
-  - spangap/spangap-lcd
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
 # tcpInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
 # rnsd ahead of it in dependency-topo order, so its port surface is up first.
