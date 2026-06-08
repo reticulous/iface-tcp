@@ -66,7 +66,62 @@
       </div>
       <PeerField label="Host" :value="String(selPeer.host ?? '')" @change="setField('host', $event)" />
       <PeerField label="Port" :value="String(selPeer.port ?? '')" @change="setField('port', Number($event))" />
+      <div class="row items-center no-wrap">
+        <div class="col-4 text-caption">Mode</div>
+        <q-select class="col" :model-value="String(selPeer.mode ?? 'gateway')" dense outlined
+          :options="modeOptions" emit-value map-options
+          @update:model-value="setField('mode', $event)" />
+      </div>
+
+      <q-expansion-item dense dense-toggle label="Advanced" header-class="text-caption ifac-adv" class="q-mt-xs">
+        <div class="q-pl-sm q-gutter-y-sm q-pt-sm">
+          <div class="text-caption" style="opacity:0.6">
+            IFAC (Interface Access Codes): set a network name + passphrase to
+            join an access-coded RNS network. Both must match the peer's, or
+            traffic is dropped. Leave blank for an open interface.
+          </div>
+          <PeerField label="IFAC network" :value="String(selPeer.ifac_netname ?? '')"
+            @change="setField('ifac_netname', $event)" />
+          <div class="row items-center no-wrap">
+            <div class="col-4 text-caption">IFAC passphrase</div>
+            <q-input class="col" :model-value="ifacKeyInput" type="password" dense outlined
+              debounce="600" placeholder="(write-only — set to change)"
+              autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false"
+              @update:model-value="onIfacKeyInput" />
+          </div>
+        </div>
+      </q-expansion-item>
     </template>
+
+    <q-separator dark class="q-mt-md" />
+
+    <div class="text-caption" style="opacity:0.7;font-weight:600">Incoming</div>
+    <div class="text-caption" style="opacity:0.6">
+      Accept inbound TCP connections — other Reticulum nodes dial this device on
+      the listen port. Each accepted connection becomes its own RNS interface.
+    </div>
+
+    <SettingToggle label="Enabled" k="s.tcp.server_enable" />
+    <SettingText   label="Listen port" k="s.tcp.server_port" />
+    <SettingSelect label="Mode" k="s.tcp.server_mode" :options="modeOptions" />
+
+    <q-expansion-item dense dense-toggle label="Advanced" header-class="text-caption" class="q-mt-xs">
+      <div class="q-pl-sm q-gutter-y-sm q-pt-sm">
+        <SettingText label="Max inbound" k="s.tcp.max_inbound" />
+        <div class="text-caption" style="opacity:0.6">
+          IFAC for accepted connections: a network name + passphrase that dialing
+          peers must match, or their traffic is dropped.
+        </div>
+        <SettingText label="IFAC network" k="s.tcp.server_ifac_netname" />
+        <div class="row items-center no-wrap">
+          <div class="col-4 text-caption">IFAC passphrase</div>
+          <q-input class="col" :model-value="serverIfacKey" type="password" dense outlined
+            debounce="600" placeholder="(write-only — set to change)"
+            autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false"
+            @update:model-value="setServerIfacKey" />
+        </div>
+      </div>
+    </q-expansion-item>
   </div>
 </template>
 
@@ -76,7 +131,15 @@ import { useDeviceStore } from 'spangap-browser/stores/device'
 
 const device = useDeviceStore()
 
-interface Peer { enable?: number; host?: string; port?: number }
+interface Peer { enable?: number; host?: string; port?: number; mode?: string; ifac_netname?: string }
+
+const modeOptions = [
+  { label: 'Full', value: 'full' },
+  { label: 'Gateway', value: 'gateway' },
+  { label: 'Access point', value: 'access_point' },
+  { label: 'Roaming', value: 'roaming' },
+  { label: 'Boundary', value: 'boundary' },
+]
 
 const peers = computed<Peer[]>(() => {
   const arr = device.get('s.tcp.peers')
@@ -85,6 +148,8 @@ const peers = computed<Peer[]>(() => {
     enable: Number(p?.enable ?? 0),
     host: String(p?.host ?? ''),
     port: Number(p?.port ?? 4965),
+    mode: String(p?.mode ?? 'gateway'),
+    ifac_netname: String(p?.ifac_netname ?? ''),
   }))
 })
 
@@ -100,6 +165,25 @@ watch(peers, (n) => {
 
 function peerState(idx: number): string {
   return String(device.get(`tcp.peers.${idx}.state`) ?? 'idle')
+}
+
+// IFAC passphrase lives in secrets.* — it never syncs back to the browser, so
+// this field is write-only. Clear it whenever the selected peer changes.
+const ifacKeyInput = ref('')
+watch(selectedIdx, () => { ifacKeyInput.value = '' })
+function onIfacKeyInput(val: string | number | null) {
+  ifacKeyInput.value = String(val ?? '')
+  if (selectedIdx.value < 0) return
+  device.set(`secrets.tcp.peers.${selectedIdx.value}.ifac_netkey`, ifacKeyInput.value)
+  device.save()
+}
+
+// Inbound-server IFAC passphrase — also a secret, also write-only.
+const serverIfacKey = ref('')
+function setServerIfacKey(val: string | number | null) {
+  serverIfacKey.value = String(val ?? '')
+  device.set('secrets.tcp.server_ifac_netkey', serverIfacKey.value)
+  device.save()
 }
 
 function writePeers(arr: any[]) {

@@ -29,8 +29,10 @@
 
 static const char* TAG = "tcp";
 
-#define TCP_VERSION    1
+#define TCP_VERSION    2
 #define TCP_MAX_PEERS  16
+#define TCP_MAX_INBOUND 8        /* hard cap on concurrent inbound connections */
+#define TCP_PORT_INBOUND 0x5443  /* ITS server port for accepted inbound conns */
 #define HDLC_FLAG      0x7E
 #define HDLC_ESC       0x7D
 #define HDLC_ESC_MASK  0x20
@@ -51,6 +53,9 @@ struct peer_t {
     char     host[64];
     uint16_t port;
     uint8_t  mode;
+    char     ifac_netname[32];   /* IFAC network_name (s.); "" = open */
+    char     ifac_netkey[64];    /* IFAC passphrase (secrets.); "" = open */
+    uint8_t  ifac_size;          /* IFAC access-code length; 0 = default */
     uint32_t retry_min_s;
     uint32_t retry_max_s;
     uint32_t cur_backoff_s;
@@ -137,8 +142,10 @@ static bool hdlcSend(int netHandle, const uint8_t* data, size_t len)
 }
 
 /* Decode bytes from net into the peer's pkt buffer. On a complete frame,
- * forward to rnsd as one ITS packet and reset assembly state. */
-static void hdlcConsume(peer_t* p, const uint8_t* in, size_t n)
+ * forward to rnsd as one ITS packet and reset assembly state. Templated so
+ * both outbound peer_t and inbound_peer_t (identical HDLC fields) can use it. */
+template<typename P>
+static void hdlcConsume(P* p, const uint8_t* in, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         uint8_t b = in[i];
@@ -197,6 +204,13 @@ static void loadPeerConfig(peer_t& p, int id)
     else if (strcmp(mode, "roaming")      == 0) p.mode = RNS_IFACE_MODE_ROAMING;
     else if (strcmp(mode, "boundary")     == 0) p.mode = RNS_IFACE_MODE_BOUNDARY;
     else                                        p.mode = RNS_IFACE_MODE_GATEWAY;
+    /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_netname", id);
+    storageGetStr(key, p.ifac_netname, sizeof(p.ifac_netname), "");
+    snprintf(key, sizeof(key), "secrets.tcp.peers.%d.ifac_netkey", id);
+    storageGetStr(key, p.ifac_netkey, sizeof(p.ifac_netkey), "");
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_size", id);
+    p.ifac_size = (uint8_t)storageGetInt(key, 0);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_min", id);
     p.retry_min_s = (uint32_t)storageGetInt(key, 2);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_max", id);
@@ -327,6 +341,9 @@ static void attemptConnect(peer_t& p)
     reg.in = reg.out = 1;
     reg.fwd = (p.mode == RNS_IFACE_MODE_GATEWAY || p.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
     reg.rpt = 0;
+    reg.ifac_size = p.ifac_size;
+    safeStrncpy(reg.ifac_netname, p.ifac_netname, sizeof(reg.ifac_netname));
+    safeStrncpy(reg.ifac_netkey,  p.ifac_netkey,  sizeof(reg.ifac_netkey));
 
     p.rnsd_handle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
                                pdMS_TO_TICKS(500), p.runtime_id, onRnsdRecv, onRnsdDisconnect);
@@ -431,12 +448,27 @@ static void reloadPeers(void) {
         if (oldIdx >= 0) {
             peer_t p = s_peers[oldIdx];
             bool wasEnabled = p.enabled;
+            /* mode + IFAC are baked into the rnsd registration at dial time, so a
+             * change to any of them only takes effect on reconnect — capture the
+             * old values and force a redial below if they moved. */
+            uint8_t oldMode = p.mode;
+            uint8_t oldIfacSize = p.ifac_size;
+            char oldNetname[sizeof(p.ifac_netname)]; safeStrncpy(oldNetname, p.ifac_netname, sizeof(oldNetname));
+            char oldNetkey[sizeof(p.ifac_netkey)];   safeStrncpy(oldNetkey,  p.ifac_netkey,  sizeof(oldNetkey));
             loadPeerConfig(p, i);            /* refreshes all fields including id */
+            bool settingsChanged = p.mode != oldMode || p.ifac_size != oldIfacSize ||
+                strcmp(p.ifac_netname, oldNetname) != 0 || strcmp(p.ifac_netkey, oldNetkey) != 0;
             if (wasEnabled && !p.enabled) {
                 disconnectPeer(p, "disabled");
                 p.state = PS_IDLE;
                 p.cur_backoff_s = 0;
             } else if (!wasEnabled && p.enabled) {
+                p.state = PS_IDLE;
+                p.cur_backoff_s = 0;
+                p.next_attempt_tick = xTaskGetTickCount();
+            } else if (settingsChanged && (p.state == PS_UP || p.state == PS_CONNECTING)) {
+                /* Reconnect so the new mode/IFAC is applied to the rnsd iface. */
+                disconnectPeer(p, "settings changed");
                 p.state = PS_IDLE;
                 p.cur_backoff_s = 0;
                 p.next_attempt_tick = xTaskGetTickCount();
@@ -533,6 +565,219 @@ static void onCmdRestart(const char* key, const char* val)
     if (s_task) xTaskNotifyGive(s_task);
 }
 
+/* ─────────────── inbound TCP server ───────────────
+ *
+ * peerModeName is defined down in the CLI section; forward-declare it so the
+ * accept handler can log the mode.
+ */
+static const char* peerModeName(uint8_t m);
+
+/*
+ * One TCP listener (registered with net on s.tcp.server_port) accepting up to
+ * s.tcp.max_inbound connections. Each accepted connection becomes its own rnsd
+ * interface "tcp_in/<addr>#<slot>", framed identically to the outbound peers
+ * (HDLC) and carrying the server's mode + IFAC. Runs on the same tcp task. */
+
+struct inbound_peer_t {
+    bool     used;
+    int      net_handle;     /* ITS server handle (TCP byte stream from net) */
+    int      rnsd_handle;    /* ITS handle to rnsd (RNS packet stream) */
+    uint8_t  mode;
+    char     addr[48];       /* client "ip" label */
+
+    /* HDLC inbound assembly — same field names as peer_t so hdlcConsume<>
+     * works on both. */
+    uint8_t  rx_pkt[RNS_MTU + 8];
+    size_t   rx_len;
+    bool     rx_in_frame;
+    bool     rx_escaping;
+    uint64_t bytes_in;
+    uint64_t bytes_out;
+};
+
+static inbound_peer_t s_inbound[TCP_MAX_INBOUND];
+
+static bool     s_serverEnable = false;
+static uint16_t s_serverPort   = 4965;
+static uint8_t  s_serverMode   = RNS_IFACE_MODE_GATEWAY;
+static int      s_maxInbound   = TCP_MAX_INBOUND;
+static char     s_serverIfacNetname[32] = "";
+static char     s_serverIfacNetkey[64]  = "";
+static uint8_t  s_serverIfacSize        = 0;
+static bool     s_serverRegistered      = false;
+
+static uint8_t modeFromStr(const char* m) {
+    if      (strcmp(m, "full")         == 0) return RNS_IFACE_MODE_FULL;
+    else if (strcmp(m, "gateway")      == 0) return RNS_IFACE_MODE_GATEWAY;
+    else if (strcmp(m, "access_point") == 0) return RNS_IFACE_MODE_ACCESS_POINT;
+    else if (strcmp(m, "roaming")      == 0) return RNS_IFACE_MODE_ROAMING;
+    else if (strcmp(m, "boundary")     == 0) return RNS_IFACE_MODE_BOUNDARY;
+    return RNS_IFACE_MODE_GATEWAY;
+}
+
+static int inboundActiveCount(void) {
+    int n = 0;
+    for (auto& ip : s_inbound) if (ip.used) n++;
+    return n;
+}
+static inbound_peer_t* inboundByNetHandle(int h) {
+    for (auto& ip : s_inbound) if (ip.used && ip.net_handle == h) return &ip;
+    return nullptr;
+}
+static inbound_peer_t* inboundByRnsdHandle(int h) {
+    for (auto& ip : s_inbound) if (ip.used && ip.rnsd_handle == h) return &ip;
+    return nullptr;
+}
+
+static void loadServerConfig(void) {
+    s_serverEnable = storageGetInt("s.tcp.server_enable", 0) != 0;
+    s_serverPort   = (uint16_t)storageGetInt("s.tcp.server_port", 4965);
+    char mode[24] = "gateway";
+    storageGetStr("s.tcp.server_mode", mode, sizeof(mode), "gateway");
+    s_serverMode = modeFromStr(mode);
+    int mi = storageGetInt("s.tcp.max_inbound", TCP_MAX_INBOUND);
+    if (mi < 0) mi = 0;
+    if (mi > TCP_MAX_INBOUND) mi = TCP_MAX_INBOUND;
+    s_maxInbound = mi;
+    storageGetStr("s.tcp.server_ifac_netname", s_serverIfacNetname, sizeof(s_serverIfacNetname), "");
+    storageGetStr("secrets.tcp.server_ifac_netkey", s_serverIfacNetkey, sizeof(s_serverIfacNetkey), "");
+    s_serverIfacSize = (uint8_t)storageGetInt("s.tcp.server_ifac_size", 0);
+}
+
+static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
+    if (ip.rnsd_handle >= 0) { itsDisconnect(ip.rnsd_handle); ip.rnsd_handle = -1; }
+    if (ip.net_handle  >= 0) { itsDisconnect(ip.net_handle);  ip.net_handle  = -1; }
+    if (ip.used) info("tcp inbound: %s closed (%s)", ip.addr, reason);
+    ip.used = false;
+}
+
+static void onInboundRnsdRecv(int handle, size_t /*bytesAvail*/) {
+    static uint8_t pkt[RNS_MTU + 16];
+    size_t n = itsRecv(handle, pkt, sizeof(pkt), 0);
+    if (n == 0) return;
+    inbound_peer_t* ip = inboundByRnsdHandle(handle);
+    if (!ip || ip->net_handle < 0) return;
+    if (!hdlcSend(ip->net_handle, pkt, n)) { warn("tcp inbound: hdlc send failed"); return; }
+    ip->bytes_out += n;
+}
+static void onInboundRnsdDisconnect(int ref) {
+    if (ref < 0 || ref >= TCP_MAX_INBOUND) return;
+    inbound_peer_t& ip = s_inbound[ref];
+    if (!ip.used) return;
+    ip.rnsd_handle = -1;
+    inboundTeardown(ip, "rnsd closed");
+}
+static void onInboundRecv(int handle, size_t /*bytesAvail*/) {
+    static uint8_t buf[1024];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n == 0) return;
+    inbound_peer_t* ip = inboundByNetHandle(handle);
+    if (!ip) return;
+    ip->bytes_in += n;
+    hdlcConsume(ip, buf, n);
+}
+static void onInboundDisconnectNet(int ref) {
+    if (ref < 0 || ref >= TCP_MAX_INBOUND) return;
+    inbound_peer_t& ip = s_inbound[ref];
+    if (!ip.used) return;
+    ip.net_handle = -1;          /* net already closed this side */
+    inboundTeardown(ip, "net closed");
+}
+
+static int onInboundConnect(int handle, const void* data, size_t len) {
+    if (!s_serverEnable) return -1;            /* soft-disabled — refuse */
+    if (inboundActiveCount() >= s_maxInbound) {
+        warn("tcp inbound: at capacity (%d), rejecting", s_maxInbound);
+        return -1;
+    }
+    /* The slot index IS the serverRef returned to net AND the ref we hand rnsd,
+     * so both disconnect callbacks resolve the same slot. */
+    int slot = -1;
+    for (int i = 0; i < TCP_MAX_INBOUND; i++) if (!s_inbound[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    inbound_peer_t& ip = s_inbound[slot];
+    ip = inbound_peer_t{};
+    ip.used = true;
+    ip.net_handle = handle;
+    ip.rnsd_handle = -1;
+    ip.mode = s_serverMode;
+
+    const char* ipstr = "?";
+    if (len >= sizeof(net_connect_t)) {
+        auto* cd = (const net_connect_t*)data;
+        ipstr = ipaddr_ntoa(&cd->clientAddr);
+    }
+    safeStrncpy(ip.addr, ipstr, sizeof(ip.addr));
+
+    rnsd_transport_t reg = {};
+    snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
+    reg.mtu     = RNS_MTU;
+    reg.bitrate = 0;
+    reg.mode    = s_serverMode;
+    reg.in = reg.out = 1;
+    reg.fwd = (s_serverMode == RNS_IFACE_MODE_GATEWAY || s_serverMode == RNS_IFACE_MODE_FULL) ? 1 : 0;
+    reg.rpt = 0;
+    reg.ifac_size = s_serverIfacSize;
+    safeStrncpy(reg.ifac_netname, s_serverIfacNetname, sizeof(reg.ifac_netname));
+    safeStrncpy(reg.ifac_netkey,  s_serverIfacNetkey,  sizeof(reg.ifac_netkey));
+
+    ip.rnsd_handle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
+                                pdMS_TO_TICKS(500), slot, onInboundRnsdRecv, onInboundRnsdDisconnect);
+    if (ip.rnsd_handle < 0) {
+        warn("tcp inbound: rnsd register failed for %s", ip.addr);
+        ip.used = false;
+        return -1;                              /* net closes the socket */
+    }
+    info("tcp inbound: accepted %s as iface %s (mode=%s)", ip.addr, reg.name, peerModeName(s_serverMode));
+    return slot;
+}
+
+/* Register the listen port with net (once). Honoured directly via tcpPort so
+ * the listen port follows s.tcp.server_port (not s.net.*). Changing the port
+ * after registration needs a reboot; enable/disable is handled by accepting or
+ * refusing connections in onInboundConnect. */
+static void serverRegister(void) {
+    if (s_serverRegistered) return;
+    net_port_msg_t reg = {};
+    reg.itsPort    = TCP_PORT_INBOUND;
+    reg.tcpPort    = s_serverPort;        /* non-zero => net uses this directly */
+    reg.tcpNoDelay = 1;
+    reg.keepAlive  = 1;
+    reg.backlog    = 4;
+    reg.defaultPort = 4965;
+    safeStrncpy(reg.nvsKey, "tcp_server_port", sizeof(reg.nvsKey));
+    if (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500))) {
+        warn("tcp: inbound server net registration failed");
+        return;
+    }
+    s_serverRegistered = true;
+    info("tcp: inbound server listening on port %u", (unsigned)s_serverPort);
+}
+
+/* Reconcile server state with config — runs on the tcp task on config change.
+ * mode/IFAC are baked at accept time, so a change drops live inbound peers to
+ * force them to re-register with the new settings on reconnect. */
+static void reconcileServer(void) {
+    uint8_t oldMode = s_serverMode, oldIfacSize = s_serverIfacSize;
+    char oldNetname[sizeof(s_serverIfacNetname)]; safeStrncpy(oldNetname, s_serverIfacNetname, sizeof(oldNetname));
+    char oldNetkey[sizeof(s_serverIfacNetkey)];   safeStrncpy(oldNetkey,  s_serverIfacNetkey,  sizeof(oldNetkey));
+    bool wasEnabled = s_serverEnable;
+
+    loadServerConfig();
+
+    bool settingsChanged = s_serverMode != oldMode || s_serverIfacSize != oldIfacSize ||
+        strcmp(s_serverIfacNetname, oldNetname) != 0 || strcmp(s_serverIfacNetkey, oldNetkey) != 0;
+
+    if (s_serverEnable && !s_serverRegistered) serverRegister();
+
+    if (!s_serverEnable) {
+        if (wasEnabled)
+            for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "server stopped");
+    } else if (settingsChanged) {
+        for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "settings changed");
+    }
+}
+
 /* ─────────────── CLI ─────────────── */
 
 static const char* peerStateName(peer_state_t s) {
@@ -545,22 +790,60 @@ static const char* peerStateName(peer_state_t s) {
     return "?";
 }
 
+static const char* peerModeName(uint8_t m) {
+    switch (m) {
+        case RNS_IFACE_MODE_FULL:         return "full";
+        case RNS_IFACE_MODE_GATEWAY:      return "gateway";
+        case RNS_IFACE_MODE_ACCESS_POINT: return "access_point";
+        case RNS_IFACE_MODE_ROAMING:      return "roaming";
+        case RNS_IFACE_MODE_BOUNDARY:     return "boundary";
+    }
+    return "gateway";
+}
+
+/* Validate a mode string; returns the canonical name or nullptr if unknown. */
+static const char* peerModeCanonical(const char* s) {
+    if (strcmp(s, "full")         == 0) return "full";
+    if (strcmp(s, "gateway")      == 0) return "gateway";
+    if (strcmp(s, "access_point") == 0) return "access_point";
+    if (strcmp(s, "roaming")      == 0) return "roaming";
+    if (strcmp(s, "boundary")     == 0) return "boundary";
+    return nullptr;
+}
+
 static void cliTcpStatus(void)
 {
     cliPrintf("global: %s%s\n", s_globalEnable ? "enabled" : "disabled",
               (s_globalEnable && !s_netUp) ? " (waiting for net)" : "");
-    if (s_peers.empty()) { cliPrintf("(no peers configured)\n"); return; }
-    cliPrintf("%-3s %-10s %-32s %-9s %s\n",
-              "#", "state", "host:port", "per-peer", "rx/tx");
-    for (auto& p : s_peers) {
-        char hp[80];
-        std::snprintf(hp, sizeof(hp), "%s:%u",
-                      p.host[0] ? p.host : "(empty)", (unsigned)p.port);
-        cliPrintf("%-3d %-10s %-32s %-9s rx=%llu tx=%llu\n",
-                  p.id, peerStateName(p.state), hp,
-                  p.enabled ? "enabled" : "disabled",
-                  (unsigned long long)p.bytes_in,
-                  (unsigned long long)p.bytes_out);
+    if (s_peers.empty()) {
+        cliPrintf("(no outbound peers configured)\n");
+    } else {
+        cliPrintf("%-3s %-10s %-28s %-13s %-9s %s\n",
+                  "#", "state", "host:port", "mode", "per-peer", "rx/tx");
+        for (auto& p : s_peers) {
+            char hp[80];
+            std::snprintf(hp, sizeof(hp), "%s:%u",
+                          p.host[0] ? p.host : "(empty)", (unsigned)p.port);
+            cliPrintf("%-3d %-10s %-28s %-13s %-9s rx=%llu tx=%llu\n",
+                      p.id, peerStateName(p.state), hp, peerModeName(p.mode),
+                      p.enabled ? "enabled" : "disabled",
+                      (unsigned long long)p.bytes_in,
+                      (unsigned long long)p.bytes_out);
+        }
+    }
+
+    cliPrintf("inbound server: %s", s_serverEnable ? "enabled" : "disabled");
+    if (s_serverEnable)
+        cliPrintf(" port=%u mode=%s active=%d/%d",
+                  (unsigned)s_serverPort, peerModeName(s_serverMode),
+                  inboundActiveCount(), s_maxInbound);
+    cliPrintf("\n");
+    for (auto& ip : s_inbound) {
+        if (!ip.used) continue;
+        cliPrintf("    in  %-24s %-13s rx=%llu tx=%llu\n",
+                  ip.addr, peerModeName(ip.mode),
+                  (unsigned long long)ip.bytes_in,
+                  (unsigned long long)ip.bytes_out);
     }
 }
 
@@ -632,6 +915,39 @@ static void cliTcpPeer(const char* rest)
 
     if (sub == "add") { cliTcpPeerAdd(rest2); return; }
 
+    if (sub == "mode") {
+        while (*rest2 == ' ') rest2++;
+        const char* sp2 = std::strchr(rest2, ' ');
+        if (!sp2) {
+            cliPrintf("usage: tcp peer mode <slot> <full|gateway|access_point|roaming|boundary>\n");
+            return;
+        }
+        std::string slotStr(rest2, sp2 - rest2);
+        const char* modeStr = sp2 + 1;
+        while (*modeStr == ' ') modeStr++;
+        char* end = nullptr;
+        long n = std::strtol(slotStr.c_str(), &end, 10);
+        if (!end || *end != '\0' || n < 0 || n >= TCP_MAX_PEERS) {
+            cliPrintf("tcp peer mode: bad slot \"%s\"\n", slotStr.c_str());
+            return;
+        }
+        const char* canon = peerModeCanonical(modeStr);
+        if (!canon) {
+            cliPrintf("tcp peer mode: bad mode \"%s\" (full|gateway|access_point|roaming|boundary)\n", modeStr);
+            return;
+        }
+        char k[80];
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld.host", n);
+        if (!storageExists(k)) {
+            cliPrintf("tcp peer mode: no peer at slot %ld\n", n);
+            return;
+        }
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld.mode", n);
+        storageSet(k, canon);
+        cliPrintf("tcp: peer %ld mode set to %s\n", n, canon);
+        return;
+    }
+
     while (*rest2 == ' ') rest2++;
     if (!*rest2) {
         cliPrintf("usage: tcp peer %s <slot>\n", sub.c_str());
@@ -682,12 +998,14 @@ static void cliTcp(const char* args)
     if (cliWantsHelp(args)) {
         cliPrintf("tcp                              list peers + status\n");
         cliPrintf("tcp start | stop | restart       global gate (s.tcp.enable)\n");
+        cliPrintf("tcp server [start|stop]          inbound TCP listener (s.tcp.server_*)\n");
         cliPrintf("tcp connect <slot>               force-connect peer (clear backoff)\n");
         cliPrintf("tcp disconnect <slot>            kick peer's connection\n");
         cliPrintf("tcp peer add <host[:port]> [mode] add a peer (port=4965, mode=gateway)\n");
         cliPrintf("tcp peer rm <slot>               remove peer slot\n");
         cliPrintf("tcp peer enable <slot>           persistently enable\n");
         cliPrintf("tcp peer disable <slot>          persistently disable\n");
+        cliPrintf("tcp peer mode <slot> <mode>      full|gateway|access_point|roaming|boundary\n");
         return;
     }
 
@@ -716,6 +1034,15 @@ static void cliTcp(const char* args)
     }
 
     if (verb == "peer") { cliTcpPeer(rest); return; }
+
+    if (verb == "server") {
+        while (*rest == ' ') rest++;
+        if (!*rest)                     { cliTcpStatus(); return; }
+        if (strcmp(rest, "start") == 0) { storageSet("s.tcp.server_enable", 1); cliPrintf("tcp: inbound server enabled\n");  return; }
+        if (strcmp(rest, "stop")  == 0) { storageSet("s.tcp.server_enable", 0); cliPrintf("tcp: inbound server disabled\n"); return; }
+        cliPrintf("usage: tcp server [start|stop]\n");
+        return;
+    }
 
     cliPrintf("unknown subcommand `%s`. try `tcp -h`.\n", verb.c_str());
 }
@@ -748,7 +1075,18 @@ static void tcpTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
-    itsClientInit(TCP_MAX_PEERS * 2);
+    itsClientInit(TCP_MAX_PEERS * 2 + TCP_MAX_INBOUND);
+
+    /* Inbound TCP server: one ITS server port; net connects to it per accepted
+     * client. Open the port + handlers regardless of enable so config can flip
+     * it on later; the listen socket is registered with net only when enabled. */
+    itsServerInit();
+    itsServerPortOpen(TCP_PORT_INBOUND, /*packetBased=*/false, TCP_MAX_INBOUND, 4096, 4096);
+    itsServerOnConnect(TCP_PORT_INBOUND,    onInboundConnect);
+    itsServerOnRecv(TCP_PORT_INBOUND,       onInboundRecv);
+    itsServerOnDisconnect(TCP_PORT_INBOUND, onInboundDisconnectNet);
+    loadServerConfig();
+    if (s_serverEnable) serverRegister();
 
     /* Cache the global gate. Default 1 — no key in storage means "on";
      * user must explicitly set s.tcp.enable=0 to stop. */
@@ -762,13 +1100,16 @@ static void tcpTaskMain(void*)
     netRegister(NET_EV_DOWN, onNetDown);
 
     storageSubscribeChanges("s.tcp.peers",        onCfgChange);
+    storageSubscribeChanges("secrets.tcp.peers",  onCfgChange);  /* IFAC passphrase */
+    storageSubscribeChanges("s.tcp.server",       onCfgChange);  /* inbound server cfg */
+    storageSubscribeChanges("secrets.tcp.server", onCfgChange);  /* server IFAC passphrase */
     storageSubscribeChanges("s.tcp.enable",       onGlobalEnableChange);
     storageSubscribeChanges("tcp.cmd.connect",    onCmdConnect);
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
 
     for (;;) {
-        if (s_configDirty) { s_configDirty = false; reloadPeers(); }
+        if (s_configDirty) { s_configDirty = false; reloadPeers(); reconcileServer(); }
 
         if (s_netEdge) {
             s_netEdge = false;
@@ -809,6 +1150,8 @@ void tcpInit(void)
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
         storageDefault("s.tcp.server_enable", 0);
         storageDefault("s.tcp.server_port", 4965);
+        storageDefault("s.tcp.server_mode", "gateway");
+        storageDefault("s.tcp.max_inbound", TCP_MAX_INBOUND);
         storageSet("s.tcp.version", TCP_VERSION);
     }
 
