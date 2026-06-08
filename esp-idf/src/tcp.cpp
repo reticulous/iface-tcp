@@ -1108,6 +1108,12 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
 
+    /* Wait for a valid clock before dialing/listening — net is expected up by
+     * now, so SNTP can sync within seconds, and we avoid registering the iface
+     * (and announcing over it) with a 1970-stamped clock. Bounded; proceeds on
+     * timeout. Config subs above queue and dispatch on the first itsPoll after. */
+    waitForTime(0);
+
     for (;;) {
         if (s_configDirty) { s_configDirty = false; reloadPeers(); reconcileServer(); }
 
