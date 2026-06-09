@@ -41,8 +41,9 @@
           <q-input :model-value="newHost" label="Host" dense outlined autofocus
             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
             @update:model-value="onHostInput"
+            @keydown="onHostKeydown"
             @keyup.enter="confirmAdd" />
-          <q-input v-model.number="newPort" label="Port" type="number" dense outlined
+          <q-input ref="portRef" v-model.number="newPort" label="Port" type="number" dense outlined
             @keyup.enter="confirmAdd" />
         </q-card-section>
         <q-card-actions align="right">
@@ -201,11 +202,22 @@ function setField(field: keyof Peer, val: any) {
 const showAddDialog = ref(false)
 const newHost = ref('')
 const newPort = ref(4965)
+const portRef = ref<any>(null)
 
 function openAddDialog() {
   newHost.value = ''
   newPort.value = 4965
   showAddDialog.value = true
+}
+
+/* Typing ":" in Host (as in "host:port") is eaten and jumps to the Port
+ * field, selecting it so the next keystrokes replace the default. Pasting a
+ * full "host:port" is still split by onHostInput. */
+function onHostKeydown(e: KeyboardEvent) {
+  if (e.key !== ':') return
+  e.preventDefault()
+  portRef.value?.focus?.()
+  portRef.value?.select?.()
 }
 
 /* Split a pasted "host:port" into the two fields. Greedy match before the
