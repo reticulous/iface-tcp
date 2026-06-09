@@ -20,3 +20,9 @@ init:
   - call: tcpInit
   - call: tcpLcdRegister
     when: spangap/spangap-lcd
+
+# Browser-side UI registration (parallel to init: above) — auto-wired into
+# the buildable SPA via straddles.gen.ts; no web-interface edit needed.
+browser_register:
+  - call: registerTcp
+    module: modules/tcp
