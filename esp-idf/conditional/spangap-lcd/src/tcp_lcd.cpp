@@ -26,5 +26,5 @@ static void tcpSettingsPane(void* arg) {
 /* when:-gated init: hook (spangap/spangap-lcd). Plain C++ linkage to match the
  * generated dispatcher's forward decl. */
 void tcpLcdRegister(void) {
-    lcdRegisterSettings("Reticulum/Transports/TCP", "TCP", tcpSettingsPane);
+    lcdRegisterSettings("Mesh Network/RNS Interfaces/TCP", "TCP", tcpSettingsPane);
 }
