@@ -23,6 +23,11 @@ Each peer = one iface. Per peer:
 - On disconnect / dial failure: deregister, schedule a reconnect with
   exponential backoff capped at e.g. 60 s.
 
+Dialing is gated on a real STA upstream (`NET_EV_UPSTREAM_UP/DOWN`,
+seeded from `netIsStaConnected()`) — not bare `NET_EV_UP`. In AP-only
+mode there's no route off-device, so peers stay idle and existing
+connections are torn down until an upstream returns.
+
 Inbound listens (currently Phase 1: only outbound; inbound listen lands
 in Phase 5) register the listen port with `net` via
 `NET_PORT_REG_PORT` and accept new connections as their own peers.
