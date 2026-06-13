@@ -1075,6 +1075,15 @@ static void tcpTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
+    /* Boot barrier: stay quiet until rns.ready — clock valid, network up, and
+     * the minimum settle floor elapsed. No dialing peers before the network
+     * we ride on is actually up. Bounded fallback so a wedged rnsd can't pin us. No rnsd, no
+     * point — so bail (don't start) if rns.ready never comes. */
+    if (!waitForFlag("rns.ready", 120)) {
+        err("[%s] rns.ready never set — not starting", TAG);
+        killSelf();
+    }
+
     itsClientInit(TCP_MAX_PEERS * 2 + TCP_MAX_INBOUND);
 
     /* Inbound TCP server: one ITS server port; net connects to it per accepted
