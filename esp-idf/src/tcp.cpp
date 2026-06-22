@@ -338,7 +338,7 @@ static void attemptConnect(peer_t& p)
     rnsd_transport_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp/%d", p.id);
     reg.mtu     = RNS_MTU;
-    reg.bitrate = 0;        /* TCP is variable */
+    reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = p.mode;
     reg.in = reg.out = 1;
     reg.fwd = (p.mode == RNS_IFACE_MODE_GATEWAY || p.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
@@ -714,7 +714,7 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     rnsd_transport_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
     reg.mtu     = RNS_MTU;
-    reg.bitrate = 0;
+    reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = s_serverMode;
     reg.in = reg.out = 1;
     reg.fwd = (s_serverMode == RNS_IFACE_MODE_GATEWAY || s_serverMode == RNS_IFACE_MODE_FULL) ? 1 : 0;
