@@ -15,6 +15,7 @@
  */
 #include "tcp.h"
 #include "spangap.h"
+#include "mem.h"
 #include "net.h"          /* netRegister, netIsUp, NET_EV_*, NET_PORT_TCP_DIAL */
 #include "ports.h"
 
@@ -278,7 +279,7 @@ static void onNetRecv(int handle, size_t /*bytesAvail*/) {
      * registered them (tcp task here), so no concurrency. Avoid
      * `thread_local` which on ESP-IDF/libgcc pulls in lazy TLS init that
      * has been seen to corrupt FreeRTOS scheduler state at boot. */
-    static uint8_t buf[1024];
+    PSRAM_BSS static uint8_t buf[1024];
     /* Always drain first, then decide what to do with it. Returning before
      * the itsRecv would leave the bytes in the buffer; ITS would keep
      * redispatching this callback with nothing consumed → busy spin (WDT). */
@@ -296,7 +297,7 @@ static void onNetDisconnect(int ref) {
     disconnectPeer(*p, "net closed");
 }
 static void onRnsdRecv(int handle, size_t /*bytesAvail*/) {
-    static uint8_t pkt[RNS_MTU + 16];
+    PSRAM_BSS static uint8_t pkt[RNS_MTU + 16];
     /* Drain first, then decide. rnsd floods this iface with the network's
      * announce stream; if we returned before itsRecv whenever the net side
      * is momentarily down, the packet would sit in the buffer and ITS would
@@ -597,7 +598,7 @@ struct inbound_peer_t {
     uint64_t bytes_out;
 };
 
-static inbound_peer_t s_inbound[TCP_MAX_INBOUND];
+PSRAM_BSS static inbound_peer_t s_inbound[TCP_MAX_INBOUND];
 
 static bool     s_serverEnable = false;
 static uint16_t s_serverPort   = 4965;
@@ -654,7 +655,7 @@ static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
 }
 
 static void onInboundRnsdRecv(int handle, size_t /*bytesAvail*/) {
-    static uint8_t pkt[RNS_MTU + 16];
+    PSRAM_BSS static uint8_t pkt[RNS_MTU + 16];
     size_t n = itsRecv(handle, pkt, sizeof(pkt), 0);
     if (n == 0) return;
     inbound_peer_t* ip = inboundByRnsdHandle(handle);
@@ -670,7 +671,7 @@ static void onInboundRnsdDisconnect(int ref) {
     inboundTeardown(ip, "rnsd closed");
 }
 static void onInboundRecv(int handle, size_t /*bytesAvail*/) {
-    static uint8_t buf[1024];
+    PSRAM_BSS static uint8_t buf[1024];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
     inbound_peer_t* ip = inboundByNetHandle(handle);
