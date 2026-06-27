@@ -1,10 +1,10 @@
 /**
- * tcp — TCP transport task.
+ * tcp — TCP interface task.
  *
  * Phase 1 scope: outbound side only. Watches s.tcp.peers[] and for each
  * enabled peer:
  *   1. Dials via net's NET_PORT_TCP_DIAL with "host:port" payload.
- *   2. On success, registers with rnsd via RNSD_PORT_TRANSPORT as
+ *   2. On success, registers with rnsd via RNSD_PORT_IFACE as
  *      iface "tcp/<id>".
  *   3. Shuttles bytes both ways with HDLC framing on the net handle
  *      (FLAG=0x7E, ESC=0x7D, ESC_MASK=0x20).
@@ -336,7 +336,7 @@ static void attemptConnect(peer_t& p)
         return;
     }
 
-    rnsd_transport_t reg = {};
+    rnsd_iface_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp/%d", p.id);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
@@ -348,7 +348,7 @@ static void attemptConnect(peer_t& p)
     safeStrncpy(reg.ifac_netname, p.ifac_netname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  p.ifac_netkey,  sizeof(reg.ifac_netkey));
 
-    p.rnsd_handle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
+    p.rnsd_handle = itsConnect("rnsd", RNSD_PORT_IFACE, &reg, sizeof(reg),
                                pdMS_TO_TICKS(500), p.runtime_id, onRnsdRecv, onRnsdDisconnect);
     if (p.rnsd_handle < 0) {
         warn("peer[%d] rnsd register failed", p.id);
@@ -568,6 +568,22 @@ static void onCmdRestart(const char* key, const char* val)
     if (s_task) xTaskNotifyGive(s_task);
 }
 
+/* Remove peer `slot`. s.tcp.peers is a JSON array, so unsetting the whole
+ * element (its patch value becomes null) deletes it AND shifts the rest down —
+ * see deepMergeIntoArray in storage.cpp — and fires the s.tcp.peers subscription,
+ * so the tcp task reloads and every UI (on-device + web) refreshes. The parallel
+ * secrets array is compacted in step. */
+static void onCmdDel(const char* key, const char* val)
+{
+    if (!val || !*val) return;   /* self-unset re-fire */
+    int slot = std::atoi(val);
+    storageUnset(key);
+    char k[64];
+    std::snprintf(k, sizeof k, "s.tcp.peers.%d",       slot); storageUnset(k);
+    std::snprintf(k, sizeof k, "secrets.tcp.peers.%d", slot); storageUnset(k);
+    info("tcp: removed peer slot %d", slot);
+}
+
 /* ─────────────── inbound TCP server ───────────────
  *
  * peerModeName is defined down in the CLI section; forward-declare it so the
@@ -712,7 +728,7 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     }
     safeStrncpy(ip.addr, ipstr, sizeof(ip.addr));
 
-    rnsd_transport_t reg = {};
+    rnsd_iface_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
@@ -724,7 +740,7 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     safeStrncpy(reg.ifac_netname, s_serverIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  s_serverIfacNetkey,  sizeof(reg.ifac_netkey));
 
-    ip.rnsd_handle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
+    ip.rnsd_handle = itsConnect("rnsd", RNSD_PORT_IFACE, &reg, sizeof(reg),
                                 pdMS_TO_TICKS(500), slot, onInboundRnsdRecv, onInboundRnsdDisconnect);
     if (ip.rnsd_handle < 0) {
         warn("tcp inbound: rnsd register failed for %s", ip.addr);
@@ -892,14 +908,26 @@ static void cliTcpPeerAdd(const char* rest)
         return;
     }
 
-    /* Write atomically; the s.tcp.peers subscription wakes the tcp
-     * task once at storageEnd(). */
-    storageBegin();
-    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.host",   slot); storageSet(k, host.c_str());
-    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.port",   slot); storageSet(k, port);
-    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.mode",   slot); storageSet(k, mode);
-    std::snprintf(k, sizeof(k), "s.tcp.peers.%d.enable", slot); storageSet(k, 1);
-    storageEnd();
+    /* Keep s.tcp.peers a JSON array (not a numeric-keyed object): the first peer
+     * is written as a one-element array via setTree (nothing to preserve);
+     * later peers merge-append as array element `slot`. The web reads an array. */
+    if (slot == 0) {
+        cJSON* arr = cJSON_CreateArray();
+        cJSON* o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "enable", 1);
+        cJSON_AddStringToObject(o, "host", host.c_str());
+        cJSON_AddNumberToObject(o, "port", port);
+        cJSON_AddStringToObject(o, "mode", mode);
+        cJSON_AddItemToArray(arr, o);
+        storageSetTree("s.tcp.peers", arr);
+    } else {
+        storageBegin();
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%d.host",   slot); storageSet(k, host.c_str());
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%d.port",   slot); storageSet(k, port);
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%d.mode",   slot); storageSet(k, mode);
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%d.enable", slot); storageSet(k, 1);
+        storageEnd();
+    }
 
     cliPrintf("tcp: added peer at slot %d: %s:%d (mode=%s)\n",
               slot, host.c_str(), port, mode);
@@ -970,8 +998,10 @@ static void cliTcpPeer(const char* rest)
     }
 
     if (sub == "rm") {
-        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n);
-        storageDeleteTree(k);
+        /* storageUnset (not storageDeleteTree) so the array element is removed
+         * AND the rest shift down, and the s.tcp.peers subscription fires. */
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n);       storageUnset(k);
+        std::snprintf(k, sizeof(k), "secrets.tcp.peers.%ld", n); storageUnset(k);
         cliPrintf("tcp: removed peer slot %ld\n", n);
         return;
     }
@@ -997,7 +1027,7 @@ static void cliTcp(const char* args)
 
     if (!*args) { cliTcpStatus(); return; }
 
-    if (std::strcmp(args, "help") == 0) { cliPrintf("%-*s TCP transport status; peers; start/stop\n", CLI_HELP_COL, "tcp [...]"); return; }
+    if (std::strcmp(args, "help") == 0) { cliPrintf("%-*s TCP interface status; peers; start/stop\n", CLI_HELP_COL, "tcp [...]"); return; }
     if (cliWantsHelp(args)) {
         cliPrintf("tcp                              list peers + status\n");
         cliPrintf("tcp start | stop | restart       global gate (s.tcp.enable)\n");
@@ -1121,6 +1151,7 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.cmd.connect",    onCmdConnect);
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
+    storageSubscribeChanges("tcp.cmd.del",        onCmdDel);
 
     /* Wait for a valid clock before dialing/listening — net is expected up by
      * now, so SNTP can sync within seconds, and we avoid registering the iface
