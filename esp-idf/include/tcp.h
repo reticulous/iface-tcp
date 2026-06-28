@@ -9,8 +9,6 @@
  * Wire format on TCP is HDLC-framed RNS packets (FLAG=0x7E, ESC=0x7D,
  * ESC_MASK=0x20). Same byte stuffing as the upstream Python
  * TCPInterface.
- *
- * See docs/component-plan.md §4 / §8.2 / §14.
  */
 #pragma once
 

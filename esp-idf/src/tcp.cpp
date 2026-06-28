@@ -1,8 +1,7 @@
 /**
- * tcp — TCP interface task.
+ * tcp — TCP interface task (outbound dial + inbound listen).
  *
- * Phase 1 scope: outbound side only. Watches s.tcp.peers[] and for each
- * enabled peer:
+ * Outbound: watches s.tcp.peers[] and for each enabled peer:
  *   1. Dials via net's NET_PORT_TCP_DIAL with "host:port" payload.
  *   2. On success, registers with rnsd via RNSD_PORT_IFACE as
  *      iface "tcp/<id>".
@@ -10,8 +9,9 @@
  *      (FLAG=0x7E, ESC=0x7D, ESC_MASK=0x20).
  *   4. Reconnect with exponential backoff per s.tcp.peers[i].retry_*.
  *
- * Inbound (TCP server) and the s.tcp.server_* config keys land in
- * Phase 5 (config-disabled by default per the plan §16).
+ * Inbound: the s.tcp.server_* config registers one TCP listener with net;
+ * each accepted client becomes its own rnsd iface "tcp_in/<addr>#<slot>",
+ * framed identically. Disabled by default (s.tcp.server_enable=0).
  */
 #include "tcp.h"
 #include "spangap.h"

@@ -1,8 +1,8 @@
-# iface-tcp — RNS-over-TCP transport for reticulous.
+# iface-tcp — RNS-over-TCP interface for reticulous.
 #
 # Outbound dial (via net's NET_PORT_TCP_DIAL) + inbound listen, HDLC
-# byte-stuffing on the wire. Each peer registers as its own iface with
-# rnsd through RNSD_PORT_TRANSPORT.
+# byte-stuffing on the wire. Each connection registers as its own RNS
+# interface with rnsd through RNSD_PORT_IFACE.
 schema_version: 1
 name: reticulous/iface-tcp
 prefix: rns_tcp
