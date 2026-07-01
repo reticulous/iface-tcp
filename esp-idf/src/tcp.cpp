@@ -1188,7 +1188,12 @@ static void tcpTaskMain(void*)
          * nextDeadline guarantees this still runs even when fully idle. */
         TickType_t pubNow = xTaskGetTickCount();
         if ((int32_t)(pubNow - s_nextPublishTick) >= 0) {
+            /* Bracket the whole pass: every peer's 5 stat keys commit as one
+             * storage op instead of 5×N sync round-trips, so the 1 Hz publish
+             * can't jam the storage op port during an inbound-message burst. */
+            storageBegin();
             for (auto& p : s_peers) publishPeerState(p);
+            storageEnd();
             s_nextPublishTick = pubNow + pdMS_TO_TICKS(1000);
         }
 
