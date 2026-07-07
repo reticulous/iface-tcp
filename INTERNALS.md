@@ -223,6 +223,14 @@ with upstream Reticulum — lives in `rnsd` and the microReticulum fork. See
 [rns INTERNALS](../rns/INTERNALS.md). A change to any IFAC field re-registers
 the interface (§5.3 / §6) because the key is captured at registration.
 
+**Verifying IFAC interop.** Dial an upstream Reticulum `rnsd` TCP server that
+has IFAC configured, with matching `network_name`+`passphrase` set on a peer
+slot here; announces flowing both ways (the dest list populates) proves
+byte-exact interop. Negative test: flip the passphrase on one side only —
+the iface rx counters keep rising but nothing decodes and no announces cross.
+Also check the rejection matrix: an IFAC-enabled peer pointed at an open
+server (and vice versa) must pass no traffic.
+
 ## 8. Command sentinels
 
 `tcp.cmd.connect` / `disconnect` / `restart` / `del` are storage keys the task
