@@ -15,6 +15,7 @@
  */
 #include "lcd.h"
 #include "storage.h"
+#include "tcp_lcd.h"
 
 #include <string>
 #include <cstdio>
@@ -220,8 +221,9 @@ void tcpSettingsPane(void* arg) {
 
 }  // namespace
 
-/* when:-gated init: hook (spangap/spangap-lcd). Plain C++ linkage to match the
- * generated dispatcher's forward decl. */
-void tcpLcdRegister(void) {
+/* The TCP settings-pane service (when:-gated on spangap-lcd via straddle.yaml
+ * services:). onInit registers the hand-written pane; the whole TU is compiled
+ * only under conditional/spangap-lcd/, so no #if is needed. */
+void TcpLcdService::onInit() {
     lcdRegisterSettings("Mesh Network/RNS Interfaces/TCP", "TCP", tcpSettingsPane);
 }

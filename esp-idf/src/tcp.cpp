@@ -1201,7 +1201,7 @@ static void tcpTaskMain(void*)
     }
 }
 
-void tcpInit(void)
+void TcpService::onInit()
 {
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
         storageDefault("s.tcp.server_enable", 0);

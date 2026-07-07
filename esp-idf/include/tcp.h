@@ -12,4 +12,11 @@
  */
 #pragma once
 
-void tcpInit(void);
+#include "service.h"
+
+/** The TCP interface as a boot-registered Service: onInit starts the interface
+ *  task (outbound dial + inbound listen). Declared in straddle.yaml `services:`. */
+class TcpService : public Service {
+public:
+    void onInit() override;
+};

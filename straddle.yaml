@@ -13,15 +13,16 @@ platforms: [idf]
 requires:
   - reticulous/rns
   - spangap/spangap-net
-# Auto-init: folded into the generated spangapInitStraddles() dispatcher.
-# tcpInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
-# rnsd ahead of it in dependency-topo order, so its port surface is up first.
-init:
-  - call: tcpInit
-  - call: tcpLcdRegister
-    when: spangap/spangap-lcd
+# Boot-registered services (folded into the generated boot registration).
+# TcpService::onInit self-registers with rnsd via ITS; `requires: reticulous/rns`
+# puts rnsd ahead of it in dependency-topo order, so its port surface is up
+# first. TcpLcdService adds the on-device Settings pane, when:-gated on
+# spangap-lcd (a hand-written peers-list editor too rich for a settings: block).
+services:
+  - { class: TcpService, header: tcp.h }
+  - { class: TcpLcdService, header: tcp_lcd.h, when: spangap/spangap-lcd }
 
-# Browser-side UI registration (parallel to init: above) — auto-wired into
+# Browser-side UI registration (parallel to services: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
 browser_register:
   - call: registerTcp
