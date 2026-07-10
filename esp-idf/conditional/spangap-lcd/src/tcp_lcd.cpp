@@ -162,7 +162,7 @@ void rebuildPeers() {
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_flex_grow(lbl, 1);
     mkBtn(r, en ? "On" : "Off", onTogglePeer, (void*)(intptr_t)i);
-    mkBtn(r, "Del", onDelPeer, (void*)(intptr_t)i);
+    mkBtn(r, LV_SYMBOL_TRASH, onDelPeer, (void*)(intptr_t)i);
   }
 }
 

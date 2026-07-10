@@ -29,7 +29,7 @@
 
     <div class="row q-gutter-x-sm q-mt-xs">
       <q-btn dense no-caps label="+" class="peer-btn" @click="openAddDialog" />
-      <q-btn dense no-caps label="&minus;" class="peer-btn" :disable="selectedIdx < 0" @click="removePeer" />
+      <q-btn dense no-caps class="peer-btn" :disable="selectedIdx < 0" @click="removePeer"><IconTrash /></q-btn>
     </div>
 
     <q-dialog v-model="showAddDialog" persistent>
@@ -129,6 +129,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
+import IconTrash from 'spangap-browser/components/IconTrash.vue'
 
 const device = useDeviceStore()
 
