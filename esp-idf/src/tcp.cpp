@@ -225,6 +225,7 @@ static void loadPeerConfig(peer_t& p, int id)
 static void publishPeerState(peer_t& p)
 {
     char key[64];
+    storageBegin();
     snprintf(key, sizeof(key), "tcp.peers.%d.up", p.id);    storageSet(key, p.state == PS_UP ? 1 : 0);
     snprintf(key, sizeof(key), "tcp.peers.%d.state", p.id);
     const char* stStr = "idle";
@@ -237,6 +238,7 @@ static void publishPeerState(peer_t& p)
     storageSet(key, stStr);
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.tx_bytes", p.id); storageSet(key, (int)(p.bytes_out & 0x7fffffff));
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.rx_bytes", p.id); storageSet(key, (int)(p.bytes_in  & 0x7fffffff));
+    storageEnd();
 }
 
 /* ─────────────── connection lifecycle ─────────────── */
@@ -579,8 +581,10 @@ static void onCmdDel(const char* key, const char* val)
     int slot = std::atoi(val);
     storageUnset(key);
     char k[64];
+    storageBegin();
     std::snprintf(k, sizeof k, "s.tcp.peers.%d",       slot); storageUnset(k);
     std::snprintf(k, sizeof k, "secrets.tcp.peers.%d", slot); storageUnset(k);
+    storageEnd();
     info("tcp: removed peer slot %d", slot);
 }
 
@@ -1000,8 +1004,10 @@ static void cliTcpPeer(const char* rest)
     if (sub == "rm") {
         /* storageUnset (not storageDeleteTree) so the array element is removed
          * AND the rest shift down, and the s.tcp.peers subscription fires. */
+        storageBegin();
         std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n);       storageUnset(k);
         std::snprintf(k, sizeof(k), "secrets.tcp.peers.%ld", n); storageUnset(k);
+        storageEnd();
         cliPrintf("tcp: removed peer slot %ld\n", n);
         return;
     }
@@ -1204,11 +1210,13 @@ static void tcpTaskMain(void*)
 void TcpService::onInit()
 {
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
+        storageBegin();
         storageDefault("s.tcp.server_enable", 0);
         storageDefault("s.tcp.server_port", 4965);
         storageDefault("s.tcp.server_mode", "gateway");
         storageDefault("s.tcp.max_inbound", TCP_MAX_INBOUND);
         storageSet("s.tcp.version", TCP_VERSION);
+        storageEnd();
     }
 
     cliRegisterCmd("tcp", cliTcp);
