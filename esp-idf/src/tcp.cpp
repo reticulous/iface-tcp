@@ -57,6 +57,7 @@ struct peer_t {
     char     ifac_netname[32];   /* IFAC network_name (s.); "" = open */
     char     ifac_netkey[64];    /* IFAC passphrase (secrets.); "" = open */
     uint8_t  ifac_size;          /* IFAC access-code length; 0 = default */
+    uint8_t  announce_cap;       /* % bandwidth cap for announces; 0 = default */
     uint32_t retry_min_s;
     uint32_t retry_max_s;
     uint32_t cur_backoff_s;
@@ -214,6 +215,8 @@ static void loadPeerConfig(peer_t& p, int id)
     storageGetStr(key, p.ifac_netkey, sizeof(p.ifac_netkey), "");
     snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_size", id);
     p.ifac_size = (uint8_t)storageGetInt(key, 0);
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.announce_cap", id);
+    p.announce_cap = (uint8_t)storageGetInt(key, RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_min", id);
     p.retry_min_s = (uint32_t)storageGetInt(key, 2);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_max", id);
@@ -347,6 +350,8 @@ static void attemptConnect(peer_t& p)
     reg.fwd = (p.mode == RNS_IFACE_MODE_GATEWAY || p.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
     reg.rpt = 0;
     reg.ifac_size = p.ifac_size;
+    reg.announce_cap = p.announce_cap;
+    reg.point_to_point = 1;   /* one peer per TCP link — no hidden nodes */
     safeStrncpy(reg.ifac_netname, p.ifac_netname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  p.ifac_netkey,  sizeof(reg.ifac_netkey));
 
@@ -458,10 +463,12 @@ static void reloadPeers(void) {
              * old values and force a redial below if they moved. */
             uint8_t oldMode = p.mode;
             uint8_t oldIfacSize = p.ifac_size;
+            uint8_t oldAnnounceCap = p.announce_cap;
             char oldNetname[sizeof(p.ifac_netname)]; safeStrncpy(oldNetname, p.ifac_netname, sizeof(oldNetname));
             char oldNetkey[sizeof(p.ifac_netkey)];   safeStrncpy(oldNetkey,  p.ifac_netkey,  sizeof(oldNetkey));
             loadPeerConfig(p, i);            /* refreshes all fields including id */
             bool settingsChanged = p.mode != oldMode || p.ifac_size != oldIfacSize ||
+                p.announce_cap != oldAnnounceCap ||
                 strcmp(p.ifac_netname, oldNetname) != 0 || strcmp(p.ifac_netkey, oldNetkey) != 0;
             if (wasEnabled && !p.enabled) {
                 disconnectPeer(p, "disabled");
@@ -627,6 +634,7 @@ static int      s_maxInbound   = TCP_MAX_INBOUND;
 static char     s_serverIfacNetname[32] = "";
 static char     s_serverIfacNetkey[64]  = "";
 static uint8_t  s_serverIfacSize        = 0;
+static uint8_t  s_serverAnnounceCap     = RNS_IFACE_ANNOUNCE_CAP_DEFAULT;
 static bool     s_serverRegistered      = false;
 
 static uint8_t modeFromStr(const char* m) {
@@ -665,6 +673,7 @@ static void loadServerConfig(void) {
     storageGetStr("s.tcp.server_ifac_netname", s_serverIfacNetname, sizeof(s_serverIfacNetname), "");
     storageGetStr("secrets.tcp.server_ifac_netkey", s_serverIfacNetkey, sizeof(s_serverIfacNetkey), "");
     s_serverIfacSize = (uint8_t)storageGetInt("s.tcp.server_ifac_size", 0);
+    s_serverAnnounceCap = (uint8_t)storageGetInt("s.tcp.server_announce_cap", RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
 }
 
 static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
@@ -741,6 +750,8 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     reg.fwd = (s_serverMode == RNS_IFACE_MODE_GATEWAY || s_serverMode == RNS_IFACE_MODE_FULL) ? 1 : 0;
     reg.rpt = 0;
     reg.ifac_size = s_serverIfacSize;
+    reg.announce_cap = s_serverAnnounceCap;
+    reg.point_to_point = 1;   /* one peer per accepted TCP connection */
     safeStrncpy(reg.ifac_netname, s_serverIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  s_serverIfacNetkey,  sizeof(reg.ifac_netkey));
 
@@ -782,6 +793,7 @@ static void serverRegister(void) {
  * force them to re-register with the new settings on reconnect. */
 static void reconcileServer(void) {
     uint8_t oldMode = s_serverMode, oldIfacSize = s_serverIfacSize;
+    uint8_t oldAnnounceCap = s_serverAnnounceCap;
     char oldNetname[sizeof(s_serverIfacNetname)]; safeStrncpy(oldNetname, s_serverIfacNetname, sizeof(oldNetname));
     char oldNetkey[sizeof(s_serverIfacNetkey)];   safeStrncpy(oldNetkey,  s_serverIfacNetkey,  sizeof(oldNetkey));
     bool wasEnabled = s_serverEnable;
@@ -789,6 +801,7 @@ static void reconcileServer(void) {
     loadServerConfig();
 
     bool settingsChanged = s_serverMode != oldMode || s_serverIfacSize != oldIfacSize ||
+        s_serverAnnounceCap != oldAnnounceCap ||
         strcmp(s_serverIfacNetname, oldNetname) != 0 || strcmp(s_serverIfacNetkey, oldNetkey) != 0;
 
     if (s_serverEnable && !s_serverRegistered) serverRegister();
