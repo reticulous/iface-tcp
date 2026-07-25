@@ -766,26 +766,26 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     return slot;
 }
 
-/* Register the listen port with net (once). Honoured directly via tcpPort so
- * the listen port follows s.tcp.server_port (not s.net.*). Changing the port
- * after registration needs a reboot; enable/disable is handled by accepting or
- * refusing connections in onInboundConnect. */
+/* Push the inbound server's desired listen state to net. The port follows
+ * s.tcp.server_port (ownPort => net binds it directly, not via s.net.*); a
+ * disabled server sends port 0 so net closes the listen socket entirely — the
+ * port opens and closes as the service is enabled and disabled. Re-sending with
+ * a new port is how a runtime port change takes effect: net rebinds on its next
+ * poll (see epOpenPort). */
 static void serverRegister(void) {
-    if (s_serverRegistered) return;
     net_port_msg_t reg = {};
     reg.itsPort    = TCP_PORT_INBOUND;
-    reg.tcpPort    = s_serverPort;        /* non-zero => net uses this directly */
+    reg.ownPort    = 1;
+    reg.tcpPort    = s_serverEnable ? s_serverPort : 0;   /* 0 => net closes the socket */
     reg.tcpNoDelay = 1;
     reg.keepAlive  = 1;
     reg.backlog    = 4;
-    reg.defaultPort = 4965;
     safeStrncpy(reg.nvsKey, "tcp_server_port", sizeof(reg.nvsKey));
     if (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500))) {
         warn("tcp: inbound server net registration failed");
         return;
     }
     s_serverRegistered = true;
-    info("tcp: inbound server listening on port %u", (unsigned)s_serverPort);
 }
 
 /* Reconcile server state with config — runs on the tcp task on config change.
@@ -794,6 +794,7 @@ static void serverRegister(void) {
 static void reconcileServer(void) {
     uint8_t oldMode = s_serverMode, oldIfacSize = s_serverIfacSize;
     uint8_t oldAnnounceCap = s_serverAnnounceCap;
+    uint16_t oldPort = s_serverPort;
     char oldNetname[sizeof(s_serverIfacNetname)]; safeStrncpy(oldNetname, s_serverIfacNetname, sizeof(oldNetname));
     char oldNetkey[sizeof(s_serverIfacNetkey)];   safeStrncpy(oldNetkey,  s_serverIfacNetkey,  sizeof(oldNetkey));
     bool wasEnabled = s_serverEnable;
@@ -803,8 +804,18 @@ static void reconcileServer(void) {
     bool settingsChanged = s_serverMode != oldMode || s_serverIfacSize != oldIfacSize ||
         s_serverAnnounceCap != oldAnnounceCap ||
         strcmp(s_serverIfacNetname, oldNetname) != 0 || strcmp(s_serverIfacNetkey, oldNetkey) != 0;
+    bool portChanged   = s_serverPort != oldPort;
+    bool enableChanged = wasEnabled != s_serverEnable;
 
-    if (s_serverEnable && !s_serverRegistered) serverRegister();
+    /* Push desired state to net: open on first enable, then re-push on every
+     * enable/disable or port change so net opens, closes, or rebinds the listen
+     * socket accordingly. A never-enabled server is never registered. */
+    if ((s_serverEnable && !s_serverRegistered) ||
+        (s_serverRegistered && (enableChanged || portChanged)))
+        serverRegister();
+
+    if (enableChanged)
+        info("tcp: inbound server %s", s_serverEnable ? "enabled" : "disabled");
 
     if (!s_serverEnable) {
         if (wasEnabled)
