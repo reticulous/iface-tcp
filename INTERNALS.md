@@ -189,13 +189,17 @@ accrued backoff and redials promptly instead of waiting it out.
 One listener serves all inbound connections; `s_inbound[TCP_MAX_INBOUND]`
 (PSRAM, 8 slots) holds the accepted ones. The ITS server port `TCP_PORT_INBOUND`
 (0x5443) is opened unconditionally at boot so config can flip the server on
-later, but the TCP listen socket is only registered with `net` when
-`s.tcp.server_enable` is set.
+later; the TCP listen socket is registered with `net` while the server is
+enabled and closed when it's disabled.
 
-`serverRegister()` sends a `net_port_msg_t` on `NET_PORT_REG_PORT` with a
-non-zero `tcpPort` (so net binds `s.tcp.server_port` directly, not via
-`s.net.*`). Changing the port after registration needs a reboot; enable/disable
-is handled purely by accepting or refusing connections.
+`serverRegister()` sends a `net_port_msg_t` on `NET_PORT_REG_PORT` with
+`ownPort=1` and `tcpPort = s.tcp.server_enable ? s.tcp.server_port : 0`, so net
+binds `s.tcp.server_port` directly (not via `s.net.*`) and a disabled server
+sends `tcpPort=0`, which closes the listen socket. Re-sending is how both a
+port change and an enable/disable take effect: net rebinds or closes on its next
+poll (see net's `epOpenPort`), no reboot. The port opens and closes as the
+service is enabled and disabled — a disabled server has no bound socket, not a
+socket that accepts then refuses.
 
 `onInboundConnect` allocates the lowest free slot (refusing with `-1` when the
 server is disabled or at `s_maxInbound`), reads the client IP from the
@@ -205,10 +209,12 @@ the serverRef handed to net and the ref handed to rnsd**, so either disconnect
 callback resolves the same slot. Traffic uses the same `hdlcConsume`/`hdlcSend`
 helpers as outbound.
 
-`reconcileServer()` runs on config change: it registers the listener if newly
-enabled, and — because mode/IFAC are baked at accept time — drops live inbound
-connections when the server is disabled or its mode/IFAC changes, forcing
-re-registration on reconnect.
+`reconcileServer()` runs on config change: it re-registers with net on first
+enable and on any later enable/disable or port change (so net opens, closes, or
+rebinds the socket), and — because mode/IFAC are baked at accept time — drops
+live inbound connections when the server is disabled or its mode/IFAC changes,
+forcing re-registration on reconnect. A never-enabled server is never
+registered.
 
 ## 7. IFAC
 

@@ -107,8 +107,8 @@ the browser.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `s.tcp.server_enable` | `0` | Accept inbound TCP connections. |
-| `s.tcp.server_port` | `4965` | Listen port. Changing it after boot needs a reboot. |
+| `s.tcp.server_enable` | `0` | Accept inbound TCP connections. Live: enabling opens the listen socket, disabling closes it (no reboot). |
+| `s.tcp.server_port` | `4965` | Listen port. Live: changing it re-binds the socket (no reboot). |
 | `s.tcp.server_mode` | `gateway` | Mode applied to every accepted interface. |
 | `s.tcp.max_inbound` | `8` | Concurrent inbound connection cap (hard ceiling 8). |
 | `s.tcp.server_ifac_netname` | `""` | IFAC network name for accepted connections. |
