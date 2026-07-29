@@ -14,6 +14,7 @@
  * framed identically. Disabled by default (s.tcp.server_enable=0).
  */
 #include "tcp.h"
+#include "rnsd.h"         /* rnsServiceRegister, rnsd_iface_t, RNSD_PORT_IFACE */
 #include "spangap.h"
 #include "mem.h"
 #include "net.h"          /* netRegister, netIsUp, NET_EV_*, NET_PORT_TCP_DIAL */
@@ -80,6 +81,8 @@ struct peer_t {
 static std::vector<peer_t> s_peers;
 static int s_next_runtime_id = 1;
 static TaskHandle_t s_task = nullptr;
+static volatile bool s_stop = false;   /* rns stop → break the task loop and park */
+static volatile bool s_parked = false; /* true while parked (stopped); tcpStop waits on it */
 static TickType_t s_nextPublishTick = 0;   /* throttles periodic stats publish to ~1 Hz */
 
 static peer_t* peerByRuntimeId(int rid) {
@@ -1140,15 +1143,9 @@ static void tcpTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
-    /* Boot barrier: stay quiet until rns.ready — clock valid, network up, and
-     * the minimum settle floor elapsed. No dialing peers before the network
-     * we ride on is actually up. Bounded fallback so a wedged rnsd can't pin us. No rnsd, no
-     * point — so bail (don't start) if rns.ready never comes. */
-    if (!waitForFlag("rns.ready", 120)) {
-        err("[%s] rns.ready never set — not starting", TAG);
-        killSelf();
-    }
-
+    /* No boot barrier here anymore: the RNS orchestrator only calls tcpStart()
+     * (which spawns this task) after rnsd is up and past its boot window, so the
+     * network we ride on is already settled by the time we run. */
     itsClientInit(TCP_MAX_PEERS * 2 + TCP_MAX_INBOUND);
 
     /* Inbound TCP server: one ITS server port; net connects to it per accepted
@@ -1160,7 +1157,6 @@ static void tcpTaskMain(void*)
     itsServerOnRecv(TCP_PORT_INBOUND,       onInboundRecv);
     itsServerOnDisconnect(TCP_PORT_INBOUND, onInboundDisconnectNet);
     loadServerConfig();
-    if (s_serverEnable) serverRegister();
 
     /* Cache the global gate. Default 1 — no key in storage means "on";
      * user must explicitly set s.tcp.enable=0 to stop. */
@@ -1170,8 +1166,15 @@ static void tcpTaskMain(void*)
      * so if we're already STA-connected onUpstreamUp fires immediately (and
      * no-ops since we seeded s_upstreamUp). */
     s_upstreamUp = netIsStaConnected();
-    netRegister(NET_EV_UPSTREAM_UP,   onUpstreamUp);
-    netRegister(NET_EV_UPSTREAM_DOWN, onUpstreamDown);
+    /* Register net callbacks once for the process — net's registry is append-only
+     * (no unregister), so re-registering per rns start would pile up duplicates.
+     * The callbacks guard s_task, so staying live across a stop is harmless. */
+    static bool s_netCbsRegistered = false;
+    if (!s_netCbsRegistered) {
+        s_netCbsRegistered = true;
+        netRegister(NET_EV_UPSTREAM_UP,   onUpstreamUp);
+        netRegister(NET_EV_UPSTREAM_DOWN, onUpstreamDown);
+    }
 
     storageSubscribeChanges("s.tcp.peers",        onCfgChange);
     storageSubscribeChanges("secrets.tcp.peers",  onCfgChange);  /* IFAC passphrase */
@@ -1183,13 +1186,18 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
     storageSubscribeChanges("tcp.cmd.del",        onCmdDel);
 
-    /* Wait for a valid clock before dialing/listening — net is expected up by
-     * now, so SNTP can sync within seconds, and we avoid registering the iface
-     * (and announcing over it) with a 1970-stamped clock. Bounded; proceeds on
-     * timeout. Config subs above queue and dispatch on the first itsPoll after. */
-    waitForTime(0);
+    /* Clock was already resolved by rnsd before it declared ready (its own
+     * waitForTime + boot window ran first), so we don't wait again here.
+     * Config subs above queue and dispatch on the first itsPoll below. */
 
-    for (;;) {
+  for (;;) {   /* Park, don't delete: this task lives across rns stop/start, so its
+                * ITS client slot, server port + storage subs are reused, not leaked. */
+    /* Re-bring-up (first entry + every resume): a dirty pass runs reloadPeers()
+     * — which rebuilds the peer vector fresh so enabled peers redial — and
+     * reconcileServer(), which re-registers the inbound listen endpoint with net
+     * (teardown sent tcpPort=0, so net reopens the socket here). */
+    s_configDirty = true;
+    while (!s_stop) {
         if (s_configDirty) { s_configDirty = false; reloadPeers(); reconcileServer(); }
 
         if (s_netEdge) {
@@ -1229,6 +1237,53 @@ static void tcpTaskMain(void*)
 
         itsPoll(nextDeadline());
     }
+
+    /* rns stop: close every open socket we hold so a restart doesn't leak fds —
+     * each outbound peer's net + rnsd handles, each live inbound conn's handles,
+     * and the inbound listen socket on net (tcpPort 0 => net closes it). Release
+     * the peer vector's heap; the re-bring-up rebuilds it from config on resume.
+     * s_inbound is PSRAM_BSS — teardown its conns but never free the array. The
+     * task parks rather than deleting, so its ITS ports + storage subs stay live
+     * and are reused on the next start; rnsd deregisters our ifaces as the
+     * handles drop (dropping the rnsd conns frees rnsd's iface slots). */
+    for (auto& p : s_peers) {
+        if (p.rnsd_handle >= 0) { itsDisconnect(p.rnsd_handle); p.rnsd_handle = -1; }
+        if (p.net_handle  >= 0) { itsDisconnect(p.net_handle);  p.net_handle  = -1; }
+    }
+    for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "tcp stopping");
+    if (s_serverRegistered) {
+        net_port_msg_t reg = {};
+        reg.itsPort = TCP_PORT_INBOUND;
+        reg.ownPort = 1;
+        reg.tcpPort = 0;   /* 0 => net closes the listen socket */
+        safeStrncpy(reg.nvsKey, "tcp_server_port", sizeof(reg.nvsKey));
+        itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500));
+        s_serverRegistered = false;
+    }
+    std::vector<peer_t>().swap(s_peers);
+
+    s_parked = true;
+    info("[%s] stopped", TAG);
+    while (s_stop) itsPoll(portMAX_DELAY);   /* park on the inbox until tcpStart un-parks */
+    s_parked = false;
+  }
+}
+
+/* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
+static void tcpStart(void) {
+    s_stop = false;
+    if (!s_task)
+        s_task = spawnTask(tcpTaskMain, TAG, 6144, nullptr, 2, 0, STACK_PSRAM);
+    else
+        xTaskNotifyGive(s_task);   /* un-park the resident task */
+}
+
+static void tcpStop(void) {
+    if (!s_task || s_stop) return;
+    s_stop = true;
+    xTaskNotifyGive(s_task);   /* break the work loop; the task parks, not deleted */
+    for (int i = 0; i < 300 && !s_parked; i++) delay(10);   /* await park */
+    if (!s_parked) warn("[%s] stop timed out", TAG);
 }
 
 void TcpService::onInit()
@@ -1245,6 +1300,9 @@ void TcpService::onInit()
 
     cliRegisterCmd("tcp", cliTcp);
 
-    /* Core 0 alongside net + rnsd, prio 2, PSRAM stack. */
-    s_task = spawnTask(tcpTaskMain, TAG, 6144, nullptr, 2, 0, STACK_PSRAM);
+    /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
+     * calls tcpStart() (which spawns tcpTaskMain) once rnsd is up and past its
+     * boot window, and rnsStop() calls tcpStop(). Core 0 alongside net + rnsd,
+     * prio 2, PSRAM stack. */
+    rnsServiceRegister(TAG, tcpStart, tcpStop, RNS_PHASE_IFACE);
 }
