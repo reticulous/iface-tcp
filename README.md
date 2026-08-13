@@ -100,6 +100,9 @@ the browser.
 | `mode` | `gateway` | Interface mode: `full`/`gateway`/`access_point`/`roaming`/`boundary`. |
 | `ifac_netname` | `""` | IFAC network name. `""` = open interface. |
 | `ifac_size` | `0` | IFAC access-code length in bytes. `0` = default (1). |
+| `retain_announces` | `0` | Keep the announces heard on this peer, not just forward them. Off by default: a TCP peer into the wider network delivers everyone's announces, unbounded, and re-acquiring any of them costs one path request over a cheap link — so rnsd keeps only what was resolved on demand, claimed, or is in active use. Turn it on for a peer that is your own infrastructure. |
+| `policy_manual` | `0` | Set this peer's transit policy by hand instead of inferring it from `mode`. Off = auto, which is stock behaviour and leaves `route_for` unread. |
+| `route_for` | `0` | Read only when `policy_manual = 1`. `1` = we provide transport for the nodes reachable through this peer: we relay announces towards them, we search on their behalf, and their paths get `s.rnsd.path.ttl_custody`. `0` = their traffic is not our business — the usual setting for an uplink into the wider network. Answering a path request for a destination we already know is never gated by this. See `rns/README.md`. |
 | `retry_min` | `2` | Reconnect backoff floor, seconds. |
 | `retry_max` | `300` | Reconnect backoff ceiling, seconds (clamped to ≥ `retry_min`). |
 
@@ -113,6 +116,7 @@ the browser.
 | `s.tcp.max_inbound` | `8` | Concurrent inbound connection cap (hard ceiling 8). |
 | `s.tcp.server_ifac_netname` | `""` | IFAC network name for accepted connections. |
 | `s.tcp.server_ifac_size` | `0` | IFAC access-code length. `0` = default (1). |
+| `s.tcp.server_retain_announces` | `0` | Keep announces heard on accepted connections. Off by default for the same reason as an outbound peer: whoever dials in is on the cheap side of this node. |
 
 ### Secrets
 

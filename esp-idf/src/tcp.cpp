@@ -59,6 +59,9 @@ struct peer_t {
     char     ifac_netkey[64];    /* IFAC passphrase (secrets.); "" = open */
     uint8_t  ifac_size;          /* IFAC access-code length; 0 = default */
     uint8_t  announce_cap;       /* % bandwidth cap for announces; 0 = default */
+    uint8_t  retain_announces;   /* keep announces heard here, not just forward them */
+    uint8_t  policy_manual;      /* 0 = auto: transit policy inferred, route_for unread */
+    uint8_t  route_for;          /* manual only: do we do transit work for this peer */
     uint32_t retry_min_s;
     uint32_t retry_max_s;
     uint32_t cur_backoff_s;
@@ -73,6 +76,12 @@ struct peer_t {
     size_t   rx_len;
     bool     rx_in_frame;
     bool     rx_escaping;
+
+    /* Coalesced rnsd-drop accounting — see noteRnsdDrop. */
+    bool       rx_drop_open;    /* a report window is in progress */
+    uint32_t   rx_drops;        /* frames dropped since the last line */
+    uint32_t   rx_drop_bytes;   /* their total payload */
+    TickType_t rx_drop_since;   /* tick the current window opened */
 
     uint64_t bytes_in;
     uint64_t bytes_out;
@@ -148,6 +157,62 @@ static bool hdlcSend(int netHandle, const uint8_t* data, size_t len)
     return sent == o;
 }
 
+/* ── coalesced rnsd-drop reporting ──
+ *
+ * When rnsd's packet link fills, EVERY inbound frame drops, and a line per
+ * dropped frame is enough work on this task to hold up the very task that
+ * would clear the condition — rnsd shares core 0 with us, so every slice
+ * spent formatting drop lines is a slice it does not get to drain the link
+ * that is overflowing. Left unbounded the storm is self-sustaining, and it
+ * shows up as a WDT trip on IDLE0 with this task caught inside the log call.
+ * So: report the first drop of a run immediately, then one summary line per
+ * window carrying how many followed. */
+static const TickType_t RNSD_DROP_WINDOW = pdMS_TO_TICKS(5000);
+
+/* Emit the accumulated tail of a window and restart it. */
+template<typename P>
+static void reportRnsdDrops(P* p, TickType_t now)
+{
+    warn("rnsd ITS send dropped: %u more frames (%u B) in %u ms",
+         (unsigned)p->rx_drops, (unsigned)p->rx_drop_bytes,
+         (unsigned)pdTICKS_TO_MS(now - p->rx_drop_since));
+    p->rx_drops      = 0;
+    p->rx_drop_bytes = 0;
+    p->rx_drop_since = now;
+}
+
+/* Count one dropped frame. Tick arithmetic is unsigned throughout, so the
+ * elapsed compare is wrap-safe and no field needs seeding beyond zero. */
+template<typename P>
+static void noteRnsdDrop(P* p, size_t n)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (!p->rx_drop_open) {
+        warn("rnsd ITS send dropped (%zu B)", n);
+        p->rx_drop_open  = true;
+        p->rx_drops      = 0;
+        p->rx_drop_bytes = 0;
+        p->rx_drop_since = now;
+        return;
+    }
+    p->rx_drops++;
+    p->rx_drop_bytes += (uint32_t)n;
+    if (now - p->rx_drop_since >= RNSD_DROP_WINDOW) reportRnsdDrops(p, now);
+}
+
+/* Close out a window whose drops stopped before it expired, so the tail is
+ * never silently lost and the next drop prints promptly again. Called from
+ * the task loop; `force` skips the window wait for teardown paths. */
+template<typename P>
+static void flushRnsdDrops(P* p, bool force = false)
+{
+    if (!p->rx_drop_open) return;
+    TickType_t now = xTaskGetTickCount();
+    if (!force && now - p->rx_drop_since < RNSD_DROP_WINDOW) return;
+    if (p->rx_drops) reportRnsdDrops(p, now);
+    else             p->rx_drop_open = false;
+}
+
 /* Decode bytes from net into the peer's pkt buffer. On a complete frame,
  * forward to rnsd as one ITS packet and reset assembly state. Templated so
  * both outbound peer_t and inbound_peer_t (identical HDLC fields) can use it. */
@@ -161,7 +226,7 @@ static void hdlcConsume(P* p, const uint8_t* in, size_t n)
                 /* End of frame — emit to rnsd. */
                 if (p->rnsd_handle >= 0) {
                     size_t s = itsSend(p->rnsd_handle, p->rx_pkt, p->rx_len, pdMS_TO_TICKS(100));
-                    if (s == 0) warn("rnsd ITS send dropped (%zu B)", p->rx_len);
+                    if (s == 0) noteRnsdDrop(p, p->rx_len);
                 }
             }
             p->rx_len = 0;
@@ -220,6 +285,19 @@ static void loadPeerConfig(peer_t& p, int id)
     p.ifac_size = (uint8_t)storageGetInt(key, 0);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.announce_cap", id);
     p.announce_cap = (uint8_t)storageGetInt(key, RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    /* Off by default. A TCP peer into the wider network delivers the announces
+     * of everyone, unbounded, and re-acquiring any of them costs one path
+     * request over a cheap link — so we keep only what was resolved on demand,
+     * claimed, or is in active use. Turn it on for a peer that is your own
+     * infrastructure. */
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.retain_announces", id);
+    p.retain_announces = (uint8_t)storageGetInt(key, 0);
+    /* Transit policy. Default auto = the behaviour this build always had; the
+     * fields below it are read only once the operator takes it off auto. */
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.policy_manual", id);
+    p.policy_manual = (uint8_t)storageGetInt(key, 0);
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.route_for", id);
+    p.route_for = (uint8_t)storageGetInt(key, 0);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_min", id);
     p.retry_min_s = (uint32_t)storageGetInt(key, 2);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_max", id);
@@ -253,6 +331,8 @@ static void disconnectPeer(peer_t& p, const char* reason)
 {
     if (p.rnsd_handle >= 0) { itsDisconnect(p.rnsd_handle); p.rnsd_handle = -1; }
     if (p.net_handle  >= 0) { itsDisconnect(p.net_handle);  p.net_handle  = -1; }
+    flushRnsdDrops(&p, /*force=*/true);
+    p.rx_drop_open = false;
     p.rx_len = 0;
     p.rx_in_frame = false;
     p.rx_escaping = false;
@@ -355,6 +435,9 @@ static void attemptConnect(peer_t& p)
     reg.ifac_size = p.ifac_size;
     reg.announce_cap = p.announce_cap;
     reg.point_to_point = 1;   /* one peer per TCP link — no hidden nodes */
+    reg.retain_announces = p.retain_announces;
+    reg.policy_manual = p.policy_manual;
+    reg.route_for     = p.route_for;
     safeStrncpy(reg.ifac_netname, p.ifac_netname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  p.ifac_netkey,  sizeof(reg.ifac_netkey));
 
@@ -467,11 +550,15 @@ static void reloadPeers(void) {
             uint8_t oldMode = p.mode;
             uint8_t oldIfacSize = p.ifac_size;
             uint8_t oldAnnounceCap = p.announce_cap;
+            uint8_t oldRetain = p.retain_announces;
+            uint8_t oldPolicy = p.policy_manual;
+            uint8_t oldRouteFor = p.route_for;
             char oldNetname[sizeof(p.ifac_netname)]; safeStrncpy(oldNetname, p.ifac_netname, sizeof(oldNetname));
             char oldNetkey[sizeof(p.ifac_netkey)];   safeStrncpy(oldNetkey,  p.ifac_netkey,  sizeof(oldNetkey));
             loadPeerConfig(p, i);            /* refreshes all fields including id */
             bool settingsChanged = p.mode != oldMode || p.ifac_size != oldIfacSize ||
-                p.announce_cap != oldAnnounceCap ||
+                p.announce_cap != oldAnnounceCap || p.retain_announces != oldRetain ||
+                p.policy_manual != oldPolicy || p.route_for != oldRouteFor ||
                 strcmp(p.ifac_netname, oldNetname) != 0 || strcmp(p.ifac_netkey, oldNetkey) != 0;
             if (wasEnabled && !p.enabled) {
                 disconnectPeer(p, "disabled");
@@ -624,6 +711,12 @@ struct inbound_peer_t {
     size_t   rx_len;
     bool     rx_in_frame;
     bool     rx_escaping;
+
+    bool       rx_drop_open;
+    uint32_t   rx_drops;
+    uint32_t   rx_drop_bytes;
+    TickType_t rx_drop_since;
+
     uint64_t bytes_in;
     uint64_t bytes_out;
 };
@@ -638,6 +731,7 @@ static char     s_serverIfacNetname[32] = "";
 static char     s_serverIfacNetkey[64]  = "";
 static uint8_t  s_serverIfacSize        = 0;
 static uint8_t  s_serverAnnounceCap     = RNS_IFACE_ANNOUNCE_CAP_DEFAULT;
+static uint8_t  s_serverRetainAnnounces = 0;
 static bool     s_serverRegistered      = false;
 
 static uint8_t modeFromStr(const char* m) {
@@ -677,11 +771,16 @@ static void loadServerConfig(void) {
     storageGetStr("secrets.tcp.server_ifac_netkey", s_serverIfacNetkey, sizeof(s_serverIfacNetkey), "");
     s_serverIfacSize = (uint8_t)storageGetInt("s.tcp.server_ifac_size", 0);
     s_serverAnnounceCap = (uint8_t)storageGetInt("s.tcp.server_announce_cap", RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    /* Same reasoning as an outbound peer: whoever dials in is on the cheap side
+     * of the node, and their announces are someone else's traffic. */
+    s_serverRetainAnnounces = (uint8_t)storageGetInt("s.tcp.server_retain_announces", 0);
 }
 
 static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
     if (ip.rnsd_handle >= 0) { itsDisconnect(ip.rnsd_handle); ip.rnsd_handle = -1; }
     if (ip.net_handle  >= 0) { itsDisconnect(ip.net_handle);  ip.net_handle  = -1; }
+    flushRnsdDrops(&ip, /*force=*/true);
+    ip.rx_drop_open = false;
     if (ip.used) info("tcp inbound: %s closed (%s)", ip.addr, reason);
     ip.used = false;
 }
@@ -755,6 +854,7 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     reg.ifac_size = s_serverIfacSize;
     reg.announce_cap = s_serverAnnounceCap;
     reg.point_to_point = 1;   /* one peer per accepted TCP connection */
+    reg.retain_announces = s_serverRetainAnnounces;
     safeStrncpy(reg.ifac_netname, s_serverIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  s_serverIfacNetkey,  sizeof(reg.ifac_netkey));
 
@@ -797,6 +897,7 @@ static void serverRegister(void) {
 static void reconcileServer(void) {
     uint8_t oldMode = s_serverMode, oldIfacSize = s_serverIfacSize;
     uint8_t oldAnnounceCap = s_serverAnnounceCap;
+    uint8_t oldRetain = s_serverRetainAnnounces;
     uint16_t oldPort = s_serverPort;
     char oldNetname[sizeof(s_serverIfacNetname)]; safeStrncpy(oldNetname, s_serverIfacNetname, sizeof(oldNetname));
     char oldNetkey[sizeof(s_serverIfacNetkey)];   safeStrncpy(oldNetkey,  s_serverIfacNetkey,  sizeof(oldNetkey));
@@ -805,7 +906,7 @@ static void reconcileServer(void) {
     loadServerConfig();
 
     bool settingsChanged = s_serverMode != oldMode || s_serverIfacSize != oldIfacSize ||
-        s_serverAnnounceCap != oldAnnounceCap ||
+        s_serverAnnounceCap != oldAnnounceCap || s_serverRetainAnnounces != oldRetain ||
         strcmp(s_serverIfacNetname, oldNetname) != 0 || strcmp(s_serverIfacNetkey, oldNetkey) != 0;
     bool portChanged   = s_serverPort != oldPort;
     bool enableChanged = wasEnabled != s_serverEnable;
@@ -1215,6 +1316,12 @@ static void tcpTaskMain(void*)
 
         servicePeers();
 
+        /* Close out any drop window whose frames stopped arriving. nextDeadline
+         * caps at 1 s while a peer is dialable, so the tail lands within a
+         * second of the window expiring. */
+        for (auto& p : s_peers) flushRnsdDrops(&p);
+        for (auto& ip : s_inbound) if (ip.used) flushRnsdDrops(&ip);
+
         /* Publish peer stats at ~1 Hz. State transitions already publish
          * immediately from attemptConnect/disconnectPeer; this periodic pass
          * only refreshes the tx/rx byte counters. Gating it is essential: a
@@ -1273,7 +1380,7 @@ static void tcpTaskMain(void*)
 static void tcpStart(void) {
     s_stop = false;
     if (!s_task)
-        s_task = spawnTask(tcpTaskMain, TAG, 6144, nullptr, 2, 0, STACK_PSRAM);
+        s_task = spawnTask(tcpTaskMain, TAG, 6144, nullptr, 1, 0, STACK_PSRAM);
     else
         xTaskNotifyGive(s_task);   /* un-park the resident task */
 }
@@ -1303,6 +1410,6 @@ void TcpService::onInit()
     /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
      * calls tcpStart() (which spawns tcpTaskMain) once rnsd is up and past its
      * boot window, and rnsStop() calls tcpStop(). Core 0 alongside net + rnsd,
-     * prio 2, PSRAM stack. */
+     * prio 1, PSRAM stack. */
     rnsServiceRegister(TAG, tcpStart, tcpStop, RNS_PHASE_IFACE);
 }

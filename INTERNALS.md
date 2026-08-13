@@ -41,7 +41,7 @@ iface-tcp/
 
 ## 2. The tcp task
 
-One FreeRTOS task, **core 0, prio 2, 6 KB PSRAM stack**, spawned by `tcpInit`.
+One FreeRTOS task, **core 0, prio 1, 6 KB PSRAM stack**, spawned by `tcpInit`.
 It is pinned alongside `net` and `rnsd` so the ITS hops between the three stay
 on-core. It owns `s_peers`, the `s_inbound[]` table, and the global/server gate
 flags; everything that mutates them runs on this task.
