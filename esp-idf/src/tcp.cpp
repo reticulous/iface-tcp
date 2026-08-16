@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <map>
 
 static const char* TAG = "tcp";
 
@@ -276,10 +277,16 @@ static void loadPeerConfig(peer_t& p, int id)
     else if (strcmp(mode, "roaming")      == 0) p.mode = RNS_IFACE_MODE_ROAMING;
     else if (strcmp(mode, "boundary")     == 0) p.mode = RNS_IFACE_MODE_BOUNDARY;
     else                                        p.mode = RNS_IFACE_MODE_GATEWAY;
-    /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
+    /* IFAC: network_name is config (s.), passphrase is a secret (secrets.).
+     * The secret is keyed by the peer's collection id, not its slot: slots
+     * shift on remove and permute on reorder, and a slot-keyed secret would
+     * silently attach to whichever peer moved into the slot. */
     snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_netname", id);
     storageGetStr(key, p.ifac_netname, sizeof(p.ifac_netname), "");
-    snprintf(key, sizeof(key), "secrets.tcp.peers.%d.ifac_netkey", id);
+    char peerId[16];
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.id", id);
+    storageGetStr(key, peerId, sizeof(peerId), "");
+    snprintf(key, sizeof(key), "secrets.tcp.peer_ifac.%s", peerId);
     storageGetStr(key, p.ifac_netkey, sizeof(p.ifac_netkey), "");
     snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_size", id);
     p.ifac_size = (uint8_t)storageGetInt(key, 0);
@@ -306,6 +313,8 @@ static void loadPeerConfig(peer_t& p, int id)
     if (p.retry_max_s < p.retry_min_s) p.retry_max_s = p.retry_min_s;
 }
 
+static std::string peerField(int idx, const char* field);   /* the collection store, below */
+
 static void publishPeerState(peer_t& p)
 {
     char key[64];
@@ -320,6 +329,21 @@ static void publishPeerState(peer_t& p)
         case PS_BACKOFF:    stStr = "backoff";    break;
     }
     storageSet(key, stStr);
+    /* The settings collection's status pill, as packed "text|colour". Which
+     * words and which colour a peer state deserves is a judgement about this
+     * interface, so it is made here rather than by each surface. */
+    std::string id = peerField(p.id, "id");
+    if (!id.empty()) {
+        const char* pill = "";
+        switch (p.state) {
+            case PS_UP:         pill = "up|green";          break;
+            case PS_CONNECTING: pill = "connecting|amber";  break;
+            case PS_BACKOFF:    pill = "backoff|red";       break;
+            case PS_IDLE:       pill = p.enabled ? "idle|grey" : "off|grey"; break;
+        }
+        snprintf(key, sizeof(key), "tcp.peer.%s", id.c_str());
+        storageSet(key, pill);
+    }
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.tx_bytes", p.id); storageSet(key, (int)(p.bytes_out & 0x7fffffff));
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.rx_bytes", p.id); storageSet(key, (int)(p.bytes_in  & 0x7fffffff));
     storageEnd();
@@ -683,6 +707,284 @@ static void onCmdDel(const char* key, const char* val)
     std::snprintf(k, sizeof k, "secrets.tcp.peers.%d", slot); storageUnset(k);
     storageEnd();
     info("tcp: removed peer slot %d", slot);
+}
+
+/* ---- the peers collection ----
+ *
+ * The settings surfaces never write s.tcp.peers. They write tcp.peer.add /
+ * .remove / .set / .order and this file applies them, so one description drives
+ * both surfaces and validation lives in one place. A rejection is a sentence on
+ * tcp.peer.error.
+ *
+ * `id` is a small number handed out on add and carried by the item forever: the
+ * array is compacted on delete (reloadPeers reads it contiguously and matches
+ * old connections by host:port), so a slot index would name a different peer
+ * after every removal. */
+
+static const char* const PEER_FIELDS[] =
+    { "id", "enable", "host", "port", "mode", "ifac_netname",
+      "announce_cap", "retain_announces", "policy_manual", "route_for",
+      "retry_min", "retry_max" };
+
+static std::string peerField(int idx, const char* field)
+{
+    char k[80];
+    std::snprintf(k, sizeof k, "s.tcp.peers.%d.%s", idx, field);
+    return storageGetStr(k, "");
+}
+
+static int peerIndexOfId(const std::string& id)
+{
+    if (id.empty()) return -1;
+    int n = storageArrayCount("s.tcp.peers");
+    for (int i = 0; i < n; i++) if (peerField(i, "id") == id) return i;
+    return -1;
+}
+
+static std::string peerNextId()
+{
+    int best = 0, n = storageArrayCount("s.tcp.peers");
+    for (int i = 0; i < n; i++) {
+        int v = std::atoi(peerField(i, "id").c_str());
+        if (v > best) best = v;
+    }
+    char buf[12];
+    std::snprintf(buf, sizeof buf, "%d", best + 1);
+    return buf;
+}
+
+static void peerError(const char* why) { storageSet("tcp.peer.error", why); }
+
+/** Accepted-mutation ack, shared by every tcp.peer.* sentinel: the open form
+ *  closes when this moves. A monotonic per-boot counter, not a read-increment —
+ *  reads see the committed tree, and the actor may not have applied the
+ *  previous bump yet. */
+static void peerAck()
+{
+    static int ack = 0;
+    storageSet("tcp.peer.done", ++ack);
+}
+
+/** Route a form's IFAC passphrase to its id-keyed secret. Write-only, and
+ *  empty means UNCHANGED — the editor prefills nothing for it, so a submit
+ *  with the field untouched must not erase a passphrase that exists. */
+static void peerSecretFromPayload(const char* json, const std::string& id)
+{
+    cJSON* o = cJSON_Parse(json);
+    cJSON* m = o ? cJSON_GetObjectItem(o, "ifac_netkey") : nullptr;
+    std::string v = cJSON_IsString(m) && m->valuestring ? m->valuestring : "";
+    if (o) cJSON_Delete(o);
+    if (v.empty()) return;
+    char k[64];
+    std::snprintf(k, sizeof k, "secrets.tcp.peer_ifac.%s", id.c_str());
+    storageSet(k, v.c_str());
+}
+
+/** What is wrong with this peer, or "" if nothing is. The one place that
+ *  decides — the add form and the item editor both land here. */
+static std::string peerRejection(const std::string& host, const std::string& portStr)
+{
+    if (host.empty()) return "A peer needs a host.";
+    if (host.find(' ') != std::string::npos) return "A host has no spaces in it.";
+    int port = portStr.empty() ? 4965 : std::atoi(portStr.c_str());
+    if (port <= 0 || port > 65535) return "A port is between 1 and 65535.";
+    return "";
+}
+
+static void peerWrite(int idx, const std::string& id,
+                      const std::map<std::string, std::string>& f)
+{
+    char k[80];
+    std::snprintf(k, sizeof k, "s.tcp.peers.%d.id", idx);
+    storageSet(k, id.c_str());
+    for (const char* field : PEER_FIELDS) {
+        if (std::strcmp(field, "id") == 0) continue;
+        std::snprintf(k, sizeof k, "s.tcp.peers.%d.%s", idx, field);
+        auto it = f.find(field);
+        if (it == f.end() || it->second.empty()) storageUnset(k);
+        else                                     storageSet(k, it->second.c_str());
+    }
+}
+
+static std::map<std::string, std::string> peerParse(const char* json, std::string* idOut)
+{
+    std::map<std::string, std::string> out;
+    cJSON* o = cJSON_Parse(json);
+    if (!o) return out;
+    for (const char* f : PEER_FIELDS) {
+        cJSON* m = cJSON_GetObjectItem(o, f);
+        if (cJSON_IsString(m)) out[f] = m->valuestring;
+    }
+    cJSON* id = cJSON_GetObjectItem(o, "_id");
+    if (idOut && cJSON_IsString(id)) *idOut = id->valuestring;
+    cJSON_Delete(o);
+    return out;
+}
+
+static void onPeerAdd(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    auto f = peerParse(payload.c_str(), nullptr);
+    std::string why = peerRejection(f["host"], f["port"]);
+    if (!why.empty()) { peerError(why.c_str()); return; }
+    int n = storageArrayCount("s.tcp.peers");
+    if (n >= TCP_MAX_PEERS) { peerError("No free peer slot."); return; }
+    if (f["port"].empty())   f["port"]   = "4965";
+    if (f["mode"].empty())   f["mode"]   = "gateway";
+    if (f["enable"].empty()) f["enable"] = "1";
+    std::string id = peerNextId();
+    storageBegin();
+    peerWrite(n, id, f);
+    peerError("");
+    storageEnd();
+    peerSecretFromPayload(payload.c_str(), id);
+    peerAck();
+    info("tcp: added peer %s:%s at %d", f["host"].c_str(), f["port"].c_str(), n);
+}
+
+static void onPeerSet(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    std::string id;
+    auto f = peerParse(payload.c_str(), &id);
+    int idx = peerIndexOfId(id);
+    if (idx < 0) { peerError("That peer is no longer configured."); return; }
+    std::string why = peerRejection(f["host"], f["port"]);
+    if (!why.empty()) { peerError(why.c_str()); return; }
+    storageBegin();
+    peerWrite(idx, id, f);
+    peerError("");
+    storageEnd();
+    peerSecretFromPayload(payload.c_str(), id);
+    peerAck();
+}
+
+/** Drop a peer, compacting the array so reloadPeers still sees it contiguous. */
+static void onPeerRemove(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string id = val;
+    storageUnset(key);
+    int idx = peerIndexOfId(id), n = storageArrayCount("s.tcp.peers");
+    if (idx < 0) { peerError("That peer is no longer configured."); return; }
+    storageBegin();
+    for (int i = idx; i < n - 1; i++) {
+        std::map<std::string, std::string> f;
+        for (const char* field : PEER_FIELDS)
+            if (std::strcmp(field, "id") != 0) f[field] = peerField(i + 1, field);
+        peerWrite(i, peerField(i + 1, "id"), f);
+    }
+    char tail[64];
+    std::snprintf(tail, sizeof tail, "s.tcp.peers.%d", n - 1);
+    storageDeleteTree(tail);
+    std::snprintf(tail, sizeof tail, "secrets.tcp.peer_ifac.%s", id.c_str());
+    storageDeleteTree(tail);
+    peerError("");
+    storageEnd();
+    peerAck();
+    info("tcp: removed peer %s", id.c_str());
+}
+
+/** An id order applied as a PREFERENCE PERMUTATION: recognized ids move into the
+ *  stated relative order, unknown ids are ignored, unmentioned ids keep their
+ *  place — so a drag is idempotent and survives a racing add or delete. */
+static void onPeerOrder(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string csv = val;
+    storageUnset(key);
+    int n = storageArrayCount("s.tcp.peers");
+    if (n <= 1) return;
+    std::vector<std::string> wanted;
+    for (size_t pos = 0; pos <= csv.size(); ) {
+        size_t comma = csv.find(',', pos);
+        wanted.push_back(csv.substr(pos, comma == std::string::npos ? comma : comma - pos));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    std::vector<std::map<std::string, std::string>> items(n);
+    std::vector<std::string> ids(n);
+    for (int i = 0; i < n; i++) {
+        ids[i] = peerField(i, "id");
+        for (const char* f : PEER_FIELDS)
+            if (std::strcmp(f, "id") != 0) items[i][f] = peerField(i, f);
+    }
+    std::vector<int> slots, order;
+    for (int i = 0; i < n; i++)
+        for (const std::string& w : wanted)
+            if (ids[i] == w) { slots.push_back(i); break; }
+    for (const std::string& w : wanted)
+        for (int i = 0; i < n; i++)
+            if (ids[i] == w) { order.push_back(i); break; }
+    if (slots.size() != order.size() || slots.empty()) return;
+    storageBegin();
+    for (size_t s = 0; s < slots.size(); s++)
+        peerWrite(slots[s], ids[order[s]], items[order[s]]);
+    peerError("");
+    storageEnd();
+    peerAck();
+}
+
+/** Connect the peer with this id. wifi-style: the collection knows ids, the
+ *  existing tcp.cmd.connect sentinel knows slots, so translate here. */
+static void onPeerConnect(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string id = val;
+    storageUnset(key);
+    int idx = peerIndexOfId(id);
+    if (idx >= 0) storageSet("tcp.cmd.connect", idx);
+}
+
+/** Give every peer the id the settings collection addresses it by, for a store
+ *  written before ids existed. Idempotent. */
+static void peerEnsureIds(void)
+{
+    int n = storageArrayCount("s.tcp.peers");
+    bool any = false;
+    for (int i = 0; i < n; i++) if (peerField(i, "id").empty()) { any = true; break; }
+    if (!any) return;
+    storageBegin();
+    for (int i = 0; i < n; i++) {
+        if (!peerField(i, "id").empty()) continue;
+        char k[80], v[12];
+        std::snprintf(v, sizeof v, "%d", i + 1);
+        std::snprintf(k, sizeof k, "s.tcp.peers.%d.id", i);
+        storageSet(k, v);
+    }
+    storageEnd();
+}
+
+/** One-time move of the slot-keyed secret store (secrets.tcp.peers.<slot>) to
+ *  the id-keyed one. Best effort: it assumes slots have not shifted since the
+ *  slot-keyed store was written, which holds for any store the slot-keyed
+ *  firmware wrote (it had no remove-compaction or reorder). The old subtree
+ *  goes away regardless, so this runs once. */
+static void peerMigrateSecrets(void)
+{
+    if (!storageExists("secrets.tcp.peers")) return;
+    int n = storageArrayCount("s.tcp.peers");
+    storageBegin();
+    for (int i = 0; i < n; i++) {
+        char k[80];
+        std::snprintf(k, sizeof k, "secrets.tcp.peers.%d.ifac_netkey", i);
+        std::string v = storageGetStr(k, "");
+        /* peerEnsureIds ran just above, but its writes are still in the actor's
+         * queue — reads see the committed tree. Compute the id it assigns
+         * (slot + 1) rather than reading it back. */
+        std::string id = peerField(i, "id");
+        if (id.empty()) id = std::to_string(i + 1);
+        if (v.empty()) continue;
+        std::snprintf(k, sizeof k, "secrets.tcp.peer_ifac.%s", id.c_str());
+        storageSet(k, v.c_str());
+    }
+    storageDeleteTree("secrets.tcp.peers");
+    storageEnd();
+    info("tcp: moved peer IFAC secrets to the id-keyed store");
 }
 
 /* ─────────────── inbound TCP server ───────────────
@@ -1286,6 +1588,17 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
     storageSubscribeChanges("tcp.cmd.del",        onCmdDel);
+
+    /* The settings collection. The UI never writes s.tcp.peers — it writes
+     * these, and this file is the array's only writer, which is what puts
+     * validation in one place and lets a rejection come back as a sentence. */
+    peerEnsureIds();
+    peerMigrateSecrets();
+    storageSubscribeChanges("tcp.peer.add",     onPeerAdd);
+    storageSubscribeChanges("tcp.peer.set",     onPeerSet);
+    storageSubscribeChanges("tcp.peer.remove",  onPeerRemove);
+    storageSubscribeChanges("tcp.peer.order",   onPeerOrder);
+    storageSubscribeChanges("tcp.peer.connect", onPeerConnect);
 
     /* Clock was already resolved by rnsd before it declared ready (its own
      * waitForTime + boot window ran first), so we don't wait again here.

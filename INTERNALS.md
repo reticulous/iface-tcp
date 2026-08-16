@@ -23,20 +23,15 @@ existing ITS services ([spangap-net](../spangap-net) for TCP, [rns](../rns)'s
   microReticulum.
 - **The `tcp` CLI**, the live `tcp.peers.<id>.*` telemetry, and the
   `tcp.cmd.*` command sentinels.
-- **The on-device LCD settings pane**
-  (`conditional/spangap-lcd/src/tcp_lcd.cpp`, `tcpLcdRegister`) and the browser
-  panel (`browser/`).
+- **The settings pane**, described declaratively in `straddle.yaml` and lowered
+  by the build to both surfaces, plus the `tcp.peer.*` sentinels behind it.
 
 ```
 iface-tcp/
 ├── esp-idf/
 │   ├── include/tcp.h          tcpInit() declaration
-│   ├── src/tcp.cpp            the tcp task: peers, inbound server, HDLC, CLI
-│   └── conditional/spangap-lcd/src/tcp_lcd.cpp   on-device settings pane
-└── browser/
-    └── src/
-        ├── modules/tcp.ts     menu registration (registerTcp)
-        └── panels/TcpPanel.vue Settings → Mesh → RNS Interfaces → TCP
+│   └── src/tcp.cpp            the tcp task: peers, inbound server, HDLC, CLI
+└── straddle.yaml              incl. the settings: block both UIs are built from
 ```
 
 ## 2. The tcp task
@@ -264,17 +259,28 @@ counts every iteration churns cJSON nonstop on CPU0 (task WDT) and fires
 change-subscriptions faster than subscribers drain them. The 1 s cap in
 `nextDeadline` guarantees the gated pass still runs when idle.
 
-## 10. On-device LCD pane
+## 10. The settings pane
 
-`tcp_lcd.cpp` builds the Settings → Mesh Network → RNS Interfaces → TCP pane via
-`lcdRegisterSettings`, registered through the `when: spangap/spangap-lcd`-gated
-`tcpLcdRegister` init hook (so no `#if` is needed — the file is only compiled
-when spangap-lcd is staged). The pane mirrors the web editor: static rows bind
-`s.tcp.server_*` directly; the dynamic peer list adds/toggles via `s.tcp.peers.*`
-writes and deletes via the `tcp.cmd.del` sentinel. It subscribes to
-`s.tcp.peers` to rebuild the list, hopping onto the lcd task (`lcdRun`) to touch
-LVGL, and nulls its widget pointers on pane delete so a late storage callback
-can't touch freed objects.
+There is no pane code. `straddle.yaml`'s `settings:` block describes the whole
+thing and the build lowers it to the browser tree, the on-device tree and the
+storage defaults. What tcp.cpp owns is the other half of the contract:
+
+- **The peer collection's sentinels** — `tcp.peer.add` / `.set` / `.remove` /
+  `.order` / `.connect`. The UI never writes `s.tcp.peers`; this file does, and
+  only in response to one of these, which is why the host and port checks
+  (`peerRejection`) exist once and answer on `tcp.peer.error` rather than being
+  a rule written into two UIs.
+- **A stable `id` per peer** (`peerNextId`, `peerEnsureIds`). A delete compacts
+  the array — `reloadPeers` reads it contiguously and re-matches live
+  connections by host:port — so a slot index would name a different peer after
+  every removal. `tcp.cmd.connect` still takes a slot; `onPeerConnect`
+  translates.
+- **`onPeerOrder` as a preference permutation** — recognized ids into the stated
+  relative order, unknown ids ignored, unmentioned ids left in place, so a drag
+  is idempotent and cannot corrupt the list against a racing add.
+- **The status pill** — `publishPeerState` writes `tcp.peer.<id>` as packed
+  `"text|colour"`. Which words and which colour a connection state deserves is
+  this interface's judgement, made here and rendered verbatim by both surfaces.
 
 ## 11. Pitfalls
 

@@ -171,16 +171,20 @@ still enabled. `tcp peer disable` is persistent — it writes
 
 Run any of these on-device with `spangap cli "<command>"`.
 
-## Browser & on-device UI
+## Settings UI
 
-- **Browser:** `panels/TcpPanel.vue` (Settings → Mesh → RNS Interfaces → TCP) —
-  a per-peer editor (host/port/enable/mode + IFAC), drag-to-reorder of the peer
-  list, the inbound-server section, and live per-peer state badges. Registered
-  via `modules/tcp.ts`.
-- **On-device LCD:** `conditional/spangap-lcd/src/tcp_lcd.cpp` adds the same
-  pane to the device's own settings (Mesh Network → RNS Interfaces → TCP),
-  compiled only when [spangap-lcd](../spangap-lcd) is in the build. Edits from
-  the LCD, the browser, and the CLI all drive the same `s.tcp.*` storage.
+**Settings → Mesh Network → RNS Interfaces → TCP** is described once, by the
+`settings:` block in `straddle.yaml`, and the build lowers it to the browser and
+to the display: the peer collection (per-peer editor for host/port/enable/mode
+and IFAC, drag or up/down reorder, live status pills) and the inbound-server
+section, identical on both.
+
+The UI never writes `s.tcp.peers`. Every mutation is a `tcp.peer.*` sentinel and
+`tcp.cpp` is the array's only writer, so the host and port checks exist once and
+a rejection comes back as a sentence on `tcp.peer.error`. Each peer carries an
+`id` that survives the compaction a delete performs, because the collection
+addresses items by it. Edits from the display, the browser and the CLI all end
+up in the same `s.tcp.*` storage.
 
 ## Dependencies
 
