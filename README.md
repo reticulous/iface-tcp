@@ -173,7 +173,7 @@ Run any of these on-device with `spangap cli "<command>"`.
 
 ## Settings UI
 
-**Settings → Mesh Network → RNS Interfaces → TCP** is described once, by the
+**Settings → Reticulum Mesh → RNS Interfaces → TCP** is described once, by the
 `settings:` block in `straddle.yaml`, and the build lowers it to the browser and
 to the display: the peer collection (per-peer editor for host/port/enable/mode
 and IFAC, drag or up/down reorder, live status pills) and the inbound-server
