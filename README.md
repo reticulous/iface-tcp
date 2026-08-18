@@ -173,11 +173,12 @@ Run any of these on-device with `spangap cli "<command>"`.
 
 ## Settings UI
 
-**Settings → Reticulum Mesh → RNS Interfaces → TCP** is described once, by the
+**Settings → Reticulum Mesh → TCP** is described once, by the
 `settings:` block in `straddle.yaml`, and the build lowers it to the browser and
-to the display: the peer collection (per-peer editor for host/port/enable/mode
-and IFAC, drag or up/down reorder, live status pills) and the inbound-server
-section, identical on both.
+to the display: the peer collection (per-peer editor for host/port/enable/mode,
+announce retention, IFAC and retry backoff, drag or up/down reorder, live status
+pills) and the inbound-server section, identical on both. The add form asks for
+host and port only; everything else about a peer is set in its editor.
 
 The UI never writes `s.tcp.peers`. Every mutation is a `tcp.peer.*` sentinel and
 `tcp.cpp` is the array's only writer, so the host and port checks exist once and

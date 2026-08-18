@@ -27,8 +27,7 @@ services:
 settings:
   - at:
       - { id: reticulum }
-      - { id: interfaces, label: "RNS Interfaces", short: "Ifaces", order: 2 }
-      - { id: tcp, label: "TCP", short: "TCP" }
+      - { id: tcp, label: "TCP", short: "TCP", order: 3 }
     rows:
       - section: "Outgoing"
       - caption: "Dial public RNS TCP servers or other Reticulum nodes by host:port. Each peer registers as its own RNS interface."
@@ -68,6 +67,9 @@ settings:
                   - { v: "access_point", l: "Access point" }
                   - { v: "roaming",      l: "Roaming" }
                   - { v: "boundary",     l: "Boundary" }
+            - section: "Announces"
+            - caption: "Off: what this peer announces is forwarded but not kept, and a destination is re-acquired with a path request when something wants it. On for a peer that is your own infrastructure — a peer into the wider network delivers everyone's announces, unbounded."
+            - switch: { label: "Keep announces", field: retain_announces }
             - section: "Access code"
             - caption: "IFAC: a network name + passphrase that must match this peer's, or traffic is dropped. Leave blank for an open interface."
             - text: { label: "IFAC network", field: ifac_netname }
@@ -91,6 +93,9 @@ settings:
             - { v: "roaming",      l: "Roaming" }
             - { v: "boundary",     l: "Boundary" }
       - text: { label: "Max inbound", key: "s.tcp.max_inbound" }
+      - section: "Announces"
+      - caption: "Keep the announces heard on accepted connections. Off for the same reason as an outbound peer: whoever dials in is on the cheap side of this node."
+      - switch: { label: "Keep announces", key: "s.tcp.server_retain_announces" }
       - section: "Access code"
       - caption: "IFAC for accepted connections: a network name + passphrase that dialing peers must match, or their traffic is dropped."
       - text: { label: "IFAC network", key: "s.tcp.server_ifac_netname" }

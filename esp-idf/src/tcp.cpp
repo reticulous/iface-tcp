@@ -1714,6 +1714,11 @@ void TcpService::onInit()
         storageDefault("s.tcp.server_port", 4965);
         storageDefault("s.tcp.server_mode", "gateway");
         storageDefault("s.tcp.max_inbound", TCP_MAX_INBOUND);
+        /* Seed the peers list as an ARRAY. Without it the first `s.tcp.peers.0.*`
+         * write lands as an object keyed "0" — a patch tree is nested objects and
+         * there is no array underneath to merge element-wise into. Every reader
+         * here counts either shape, but the tree goes to the browser verbatim. */
+        storageDefaultTree("s.tcp", "{\"peers\":[]}");
         storageSet("s.tcp.version", TCP_VERSION);
         storageEnd();
     }
