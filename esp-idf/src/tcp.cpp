@@ -9,9 +9,9 @@
  *      (FLAG=0x7E, ESC=0x7D, ESC_MASK=0x20).
  *   4. Reconnect with exponential backoff per s.tcp.peers[i].retry_*.
  *
- * Inbound: the s.tcp.server_* config registers one TCP listener with net;
- * each accepted client becomes its own rnsd iface "tcp_in/<addr>#<slot>",
- * framed identically. Disabled by default (s.tcp.server_enable=0).
+ * Inbound: the s.tcp.servers[] collection (Incoming Ports) registers one TCP
+ * listener with net per entry; each accepted client becomes its own rnsd
+ * iface "tcp_in/<addr>#<slot>", framed identically.
  */
 #include "tcp.h"
 #include "rnsd.h"         /* rnsServiceRegister, rnsd_iface_t, RNSD_PORT_IFACE */
@@ -32,9 +32,10 @@
 
 static const char* TAG = "tcp";
 
-#define TCP_VERSION    2
+#define TCP_VERSION    3
 #define TCP_MAX_PEERS  16
 #define TCP_MAX_INBOUND 8        /* hard cap on concurrent inbound connections */
+#define TCP_MAX_SERVERS 4        /* incoming-port listeners (s.tcp.servers) */
 #define TCP_PORT_INBOUND 0x5443  /* ITS server port for accepted inbound conns */
 #define HDLC_FLAG      0x7E
 #define HDLC_ESC       0x7D
@@ -57,12 +58,10 @@ struct peer_t {
     uint16_t port;
     uint8_t  mode;
     char     ifac_netname[32];   /* IFAC network_name (s.); "" = open */
-    char     ifac_netkey[64];    /* IFAC passphrase (secrets.); "" = open */
+    char     ifac_netkey[64];    /* IFAC passphrase; "" = open */
     uint8_t  ifac_size;          /* IFAC access-code length; 0 = default */
     uint8_t  announce_cap;       /* % bandwidth cap for announces; 0 = default */
-    uint8_t  retain_announces;   /* keep announces heard here, not just forward them */
-    uint8_t  policy_manual;      /* 0 = auto: transit policy inferred, route_for unread */
-    uint8_t  route_for;          /* manual only: do we do transit work for this peer */
+    uint8_t  community_radius;   /* serve nodes within this many hops via this peer; 0 = none */
     uint32_t retry_min_s;
     uint32_t retry_max_s;
     uint32_t cur_backoff_s;
@@ -269,42 +268,33 @@ static void loadPeerConfig(peer_t& p, int id)
     snprintf(key, sizeof(key), "s.tcp.peers.%d.port", id);
     p.port = (uint16_t)storageGetInt(key, 4965);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.mode", id);
-    char mode[24] = "gateway";
-    storageGetStr(key, mode, sizeof(mode), "gateway");
+    char mode[24] = "access_point";
+    storageGetStr(key, mode, sizeof(mode), "access_point");
     if      (strcmp(mode, "full")         == 0) p.mode = RNS_IFACE_MODE_FULL;
     else if (strcmp(mode, "gateway")      == 0) p.mode = RNS_IFACE_MODE_GATEWAY;
     else if (strcmp(mode, "access_point") == 0) p.mode = RNS_IFACE_MODE_ACCESS_POINT;
     else if (strcmp(mode, "roaming")      == 0) p.mode = RNS_IFACE_MODE_ROAMING;
     else if (strcmp(mode, "boundary")     == 0) p.mode = RNS_IFACE_MODE_BOUNDARY;
-    else                                        p.mode = RNS_IFACE_MODE_GATEWAY;
-    /* IFAC: network_name is config (s.), passphrase is a secret (secrets.).
-     * The secret is keyed by the peer's collection id, not its slot: slots
-     * shift on remove and permute on reorder, and a slot-keyed secret would
-     * silently attach to whichever peer moved into the slot. */
+    else                                        p.mode = RNS_IFACE_MODE_ACCESS_POINT;
+    /* IFAC: both halves are ordinary fields of the item. The passphrase is
+     * masked where it is shown and readable where it is asked for — it is the
+     * code the other end of this link was given, and an operator who cannot
+     * read back what they typed cannot tell why the link is silent. */
     snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_netname", id);
     storageGetStr(key, p.ifac_netname, sizeof(p.ifac_netname), "");
-    char peerId[16];
-    snprintf(key, sizeof(key), "s.tcp.peers.%d.id", id);
-    storageGetStr(key, peerId, sizeof(peerId), "");
-    snprintf(key, sizeof(key), "secrets.tcp.peer_ifac.%s", peerId);
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_netkey", id);
     storageGetStr(key, p.ifac_netkey, sizeof(p.ifac_netkey), "");
     snprintf(key, sizeof(key), "s.tcp.peers.%d.ifac_size", id);
     p.ifac_size = (uint8_t)storageGetInt(key, 0);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.announce_cap", id);
     p.announce_cap = (uint8_t)storageGetInt(key, RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
-    /* Off by default. A TCP peer into the wider network delivers the announces
-     * of everyone, unbounded, and re-acquiring any of them costs one path
-     * request over a cheap link — so we keep only what was resolved on demand,
-     * claimed, or is in active use. Turn it on for a peer that is your own
-     * infrastructure. */
-    snprintf(key, sizeof(key), "s.tcp.peers.%d.retain_announces", id);
-    p.retain_announces = (uint8_t)storageGetInt(key, 0);
-    /* Transit policy. Default auto = the behaviour this build always had; the
-     * fields below it are read only once the operator takes it off auto. */
-    snprintf(key, sizeof(key), "s.tcp.peers.%d.policy_manual", id);
-    p.policy_manual = (uint8_t)storageGetInt(key, 0);
-    snprintf(key, sizeof(key), "s.tcp.peers.%d.route_for", id);
-    p.route_for = (uint8_t)storageGetInt(key, 0);
+    /* Radius 0 by default: a TCP peer into the wider network delivers the
+     * announces of everyone, unbounded, and re-acquiring any of them costs
+     * one path request over a cheap link — so nothing unrequested is stored
+     * and no errands are run. Raise it for a peer that fronts a segment this
+     * node should serve. */
+    snprintf(key, sizeof(key), "s.tcp.peers.%d.community_radius", id);
+    p.community_radius = (uint8_t)storageGetInt(key, 0);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_min", id);
     p.retry_min_s = (uint32_t)storageGetInt(key, 2);
     snprintf(key, sizeof(key), "s.tcp.peers.%d.retry_max", id);
@@ -459,9 +449,7 @@ static void attemptConnect(peer_t& p)
     reg.ifac_size = p.ifac_size;
     reg.announce_cap = p.announce_cap;
     reg.point_to_point = 1;   /* one peer per TCP link — no hidden nodes */
-    reg.retain_announces = p.retain_announces;
-    reg.policy_manual = p.policy_manual;
-    reg.route_for     = p.route_for;
+    reg.community_radius = p.community_radius;
     safeStrncpy(reg.ifac_netname, p.ifac_netname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  p.ifac_netkey,  sizeof(reg.ifac_netkey));
 
@@ -547,6 +535,20 @@ static void reloadPeers(void) {
         storageGetStr(key, desired[i].host, sizeof(desired[i].host), "");
         snprintf(key, sizeof(key), "s.tcp.peers.%d.port", i);
         desired[i].port = (uint16_t)storageGetInt(key, 4965);
+        /* Self-heal the derived display title (Name, else host:port) so an
+         * entry written before the field existed still renders one. */
+        snprintf(key, sizeof(key), "s.tcp.peers.%d.display", i);
+        char disp[80] = "";
+        storageGetStr(key, disp, sizeof(disp), "");
+        if (!disp[0]) {
+            char namebuf[64] = "";
+            char nk[64];
+            snprintf(nk, sizeof(nk), "s.tcp.peers.%d.name", i);
+            storageGetStr(nk, namebuf, sizeof(namebuf), "");
+            if (namebuf[0]) snprintf(disp, sizeof(disp), "%s", namebuf);
+            else snprintf(disp, sizeof(disp), "%s:%u", desired[i].host, (unsigned)desired[i].port);
+            storageSet(key, disp);
+        }
     }
 
     /* Build new vector by matching old peers to desired entries by host:port,
@@ -574,15 +576,12 @@ static void reloadPeers(void) {
             uint8_t oldMode = p.mode;
             uint8_t oldIfacSize = p.ifac_size;
             uint8_t oldAnnounceCap = p.announce_cap;
-            uint8_t oldRetain = p.retain_announces;
-            uint8_t oldPolicy = p.policy_manual;
-            uint8_t oldRouteFor = p.route_for;
+            uint8_t oldRadius = p.community_radius;
             char oldNetname[sizeof(p.ifac_netname)]; safeStrncpy(oldNetname, p.ifac_netname, sizeof(oldNetname));
             char oldNetkey[sizeof(p.ifac_netkey)];   safeStrncpy(oldNetkey,  p.ifac_netkey,  sizeof(oldNetkey));
             loadPeerConfig(p, i);            /* refreshes all fields including id */
             bool settingsChanged = p.mode != oldMode || p.ifac_size != oldIfacSize ||
-                p.announce_cap != oldAnnounceCap || p.retain_announces != oldRetain ||
-                p.policy_manual != oldPolicy || p.route_for != oldRouteFor ||
+                p.announce_cap != oldAnnounceCap || p.community_radius != oldRadius ||
                 strcmp(p.ifac_netname, oldNetname) != 0 || strcmp(p.ifac_netkey, oldNetkey) != 0;
             if (wasEnabled && !p.enabled) {
                 disconnectPeer(p, "disabled");
@@ -694,8 +693,8 @@ static void onCmdRestart(const char* key, const char* val)
 /* Remove peer `slot`. s.tcp.peers is a JSON array, so unsetting the whole
  * element (its patch value becomes null) deletes it AND shifts the rest down —
  * see deepMergeIntoArray in storage.cpp — and fires the s.tcp.peers subscription,
- * so the tcp task reloads and every UI (on-device + web) refreshes. The parallel
- * secrets array is compacted in step. */
+ * so the tcp task reloads and every UI (on-device + web) refreshes. Every field
+ * of the peer, IFAC passphrase included, is in that element and goes with it. */
 static void onCmdDel(const char* key, const char* val)
 {
     if (!val || !*val) return;   /* self-unset re-fire */
@@ -703,8 +702,7 @@ static void onCmdDel(const char* key, const char* val)
     storageUnset(key);
     char k[64];
     storageBegin();
-    std::snprintf(k, sizeof k, "s.tcp.peers.%d",       slot); storageUnset(k);
-    std::snprintf(k, sizeof k, "secrets.tcp.peers.%d", slot); storageUnset(k);
+    std::snprintf(k, sizeof k, "s.tcp.peers.%d", slot); storageUnset(k);
     storageEnd();
     info("tcp: removed peer slot %d", slot);
 }
@@ -722,8 +720,9 @@ static void onCmdDel(const char* key, const char* val)
  * after every removal. */
 
 static const char* const PEER_FIELDS[] =
-    { "id", "enable", "host", "port", "mode", "ifac_netname",
-      "announce_cap", "retain_announces", "policy_manual", "route_for",
+    { "id", "name", "enable", "host", "port", "mode",
+      "ifac_netname", "ifac_netkey",
+      "announce_cap", "community_radius",
       "retry_min", "retry_max" };
 
 static std::string peerField(int idx, const char* field)
@@ -765,21 +764,6 @@ static void peerAck()
     storageSet("tcp.peer.done", ++ack);
 }
 
-/** Route a form's IFAC passphrase to its id-keyed secret. Write-only, and
- *  empty means UNCHANGED — the editor prefills nothing for it, so a submit
- *  with the field untouched must not erase a passphrase that exists. */
-static void peerSecretFromPayload(const char* json, const std::string& id)
-{
-    cJSON* o = cJSON_Parse(json);
-    cJSON* m = o ? cJSON_GetObjectItem(o, "ifac_netkey") : nullptr;
-    std::string v = cJSON_IsString(m) && m->valuestring ? m->valuestring : "";
-    if (o) cJSON_Delete(o);
-    if (v.empty()) return;
-    char k[64];
-    std::snprintf(k, sizeof k, "secrets.tcp.peer_ifac.%s", id.c_str());
-    storageSet(k, v.c_str());
-}
-
 /** What is wrong with this peer, or "" if nothing is. The one place that
  *  decides — the add form and the item editor both land here. */
 static std::string peerRejection(const std::string& host, const std::string& portStr)
@@ -804,6 +788,16 @@ static void peerWrite(int idx, const std::string& id,
         if (it == f.end() || it->second.empty()) storageUnset(k);
         else                                     storageSet(k, it->second.c_str());
     }
+    /* The list's display title, derived here so both surfaces render the same
+     * fallback: the Name field when one is set, host:port otherwise. */
+    auto fv = [&](const char* field) {
+        auto it = f.find(field);
+        return it != f.end() ? it->second : peerField(idx, field);
+    };
+    std::string display = fv("name");
+    if (display.empty()) display = fv("host") + ":" + fv("port");
+    std::snprintf(k, sizeof k, "s.tcp.peers.%d.display", idx);
+    storageSet(k, display.c_str());
 }
 
 static std::map<std::string, std::string> peerParse(const char* json, std::string* idOut)
@@ -832,14 +826,13 @@ static void onPeerAdd(const char* key, const char* val)
     int n = storageArrayCount("s.tcp.peers");
     if (n >= TCP_MAX_PEERS) { peerError("No free peer slot."); return; }
     if (f["port"].empty())   f["port"]   = "4965";
-    if (f["mode"].empty())   f["mode"]   = "gateway";
+    if (f["mode"].empty())   f["mode"]   = "access_point";
     if (f["enable"].empty()) f["enable"] = "1";
     std::string id = peerNextId();
     storageBegin();
     peerWrite(n, id, f);
     peerError("");
     storageEnd();
-    peerSecretFromPayload(payload.c_str(), id);
     peerAck();
     info("tcp: added peer %s:%s at %d", f["host"].c_str(), f["port"].c_str(), n);
 }
@@ -859,7 +852,6 @@ static void onPeerSet(const char* key, const char* val)
     peerWrite(idx, id, f);
     peerError("");
     storageEnd();
-    peerSecretFromPayload(payload.c_str(), id);
     peerAck();
 }
 
@@ -880,8 +872,6 @@ static void onPeerRemove(const char* key, const char* val)
     }
     char tail[64];
     std::snprintf(tail, sizeof tail, "s.tcp.peers.%d", n - 1);
-    storageDeleteTree(tail);
-    std::snprintf(tail, sizeof tail, "secrets.tcp.peer_ifac.%s", id.c_str());
     storageDeleteTree(tail);
     peerError("");
     storageEnd();
@@ -929,6 +919,197 @@ static void onPeerOrder(const char* key, const char* val)
     peerAck();
 }
 
+/* ---- the Incoming Ports collection (s.tcp.servers) ----
+ *
+ * Same shape as the peers collection: the surfaces write tcp.server.add /
+ * .remove / .set / .order, this file applies them, and a rejection is a
+ * sentence on tcp.server.error. `id` is handed out on add and carried by the
+ * item forever; the array is compacted on delete. */
+
+static const char* const SERVER_FIELDS[] =
+    { "id", "enable", "port", "mode", "max_conns",
+      "community_radius", "ifac_netname", "ifac_netkey", "announce_cap" };
+
+static std::string srvField(int idx, const char* field)
+{
+    char k[80];
+    std::snprintf(k, sizeof k, "s.tcp.servers.%d.%s", idx, field);
+    return storageGetStr(k, "");
+}
+
+static int srvIndexOfId(const std::string& id)
+{
+    if (id.empty()) return -1;
+    int n = storageArrayCount("s.tcp.servers");
+    for (int i = 0; i < n; i++) if (srvField(i, "id") == id) return i;
+    return -1;
+}
+
+static std::string srvNextId()
+{
+    int best = 0, n = storageArrayCount("s.tcp.servers");
+    for (int i = 0; i < n; i++) {
+        int v = std::atoi(srvField(i, "id").c_str());
+        if (v > best) best = v;
+    }
+    char buf[12];
+    std::snprintf(buf, sizeof buf, "%d", best + 1);
+    return buf;
+}
+
+static void srvError(const char* why) { storageSet("tcp.server.error", why); }
+
+static void srvAck()
+{
+    static int ack = 0;
+    storageSet("tcp.server.done", ++ack);
+}
+
+/** What is wrong with this server, or "" if nothing is. `exceptId` skips the
+ *  item being edited in the duplicate-port check. */
+static std::string srvRejection(const std::string& portStr, const std::string& exceptId)
+{
+    int port = portStr.empty() ? 4965 : std::atoi(portStr.c_str());
+    if (port <= 0 || port > 65535) return "A port is between 1 and 65535.";
+    int n = storageArrayCount("s.tcp.servers");
+    for (int i = 0; i < n; i++) {
+        if (!exceptId.empty() && srvField(i, "id") == exceptId) continue;
+        if (std::atoi(srvField(i, "port").c_str()) == port)
+            return "That port already has a listener.";
+    }
+    return "";
+}
+
+static void srvWrite(int idx, const std::string& id,
+                     const std::map<std::string, std::string>& f)
+{
+    char k[80];
+    std::snprintf(k, sizeof k, "s.tcp.servers.%d.id", idx);
+    storageSet(k, id.c_str());
+    for (const char* field : SERVER_FIELDS) {
+        if (std::strcmp(field, "id") == 0) continue;
+        std::snprintf(k, sizeof k, "s.tcp.servers.%d.%s", idx, field);
+        auto it = f.find(field);
+        if (it == f.end() || it->second.empty()) storageUnset(k);
+        else                                     storageSet(k, it->second.c_str());
+    }
+}
+
+static std::map<std::string, std::string> srvParse(const char* json, std::string* idOut)
+{
+    std::map<std::string, std::string> out;
+    cJSON* o = cJSON_Parse(json);
+    if (!o) return out;
+    for (const char* f : SERVER_FIELDS) {
+        cJSON* m = cJSON_GetObjectItem(o, f);
+        if (cJSON_IsString(m)) out[f] = m->valuestring;
+    }
+    cJSON* id = cJSON_GetObjectItem(o, "_id");
+    if (idOut && cJSON_IsString(id)) *idOut = id->valuestring;
+    cJSON_Delete(o);
+    return out;
+}
+
+static void onSrvAdd(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    auto f = srvParse(payload.c_str(), nullptr);
+    std::string why = srvRejection(f["port"], "");
+    if (!why.empty()) { srvError(why.c_str()); return; }
+    int n = storageArrayCount("s.tcp.servers");
+    if (n >= TCP_MAX_SERVERS) { srvError("No free listener slot."); return; }
+    if (f["port"].empty())   f["port"]   = "4965";
+    if (f["mode"].empty())   f["mode"]   = "access_point";
+    if (f["enable"].empty()) f["enable"] = "1";
+    std::string id = srvNextId();
+    storageBegin();
+    srvWrite(n, id, f);
+    srvError("");
+    storageEnd();
+    srvAck();
+    info("tcp: added incoming port %s at %d", f["port"].c_str(), n);
+}
+
+static void onSrvSet(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    std::string id;
+    auto f = srvParse(payload.c_str(), &id);
+    int idx = srvIndexOfId(id);
+    if (idx < 0) { srvError("That listener is no longer configured."); return; }
+    std::string why = srvRejection(f["port"], id);
+    if (!why.empty()) { srvError(why.c_str()); return; }
+    storageBegin();
+    srvWrite(idx, id, f);
+    srvError("");
+    storageEnd();
+    srvAck();
+}
+
+static void onSrvRemove(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string id = val;
+    storageUnset(key);
+    int idx = srvIndexOfId(id), n = storageArrayCount("s.tcp.servers");
+    if (idx < 0) { srvError("That listener is no longer configured."); return; }
+    storageBegin();
+    for (int i = idx; i < n - 1; i++) {
+        std::map<std::string, std::string> f;
+        for (const char* field : SERVER_FIELDS)
+            if (std::strcmp(field, "id") != 0) f[field] = srvField(i + 1, field);
+        srvWrite(i, srvField(i + 1, "id"), f);
+    }
+    char tail[64];
+    std::snprintf(tail, sizeof tail, "s.tcp.servers.%d", n - 1);
+    storageDeleteTree(tail);
+    srvError("");
+    storageEnd();
+    srvAck();
+    info("tcp: removed incoming port %s", id.c_str());
+}
+
+static void onSrvOrder(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string csv = val;
+    storageUnset(key);
+    int n = storageArrayCount("s.tcp.servers");
+    if (n <= 1) return;
+    std::vector<std::string> wanted;
+    for (size_t pos = 0; pos <= csv.size(); ) {
+        size_t comma = csv.find(',', pos);
+        wanted.push_back(csv.substr(pos, comma == std::string::npos ? comma : comma - pos));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    std::vector<std::map<std::string, std::string>> items(n);
+    std::vector<std::string> ids(n);
+    for (int i = 0; i < n; i++) {
+        ids[i] = srvField(i, "id");
+        for (const char* f : SERVER_FIELDS)
+            if (std::strcmp(f, "id") != 0) items[i][f] = srvField(i, f);
+    }
+    std::vector<int> slots, order;
+    for (int i = 0; i < n; i++)
+        for (const std::string& w : wanted)
+            if (ids[i] == w) { slots.push_back(i); break; }
+    for (const std::string& w : wanted)
+        for (int i = 0; i < n; i++)
+            if (ids[i] == w) { order.push_back(i); break; }
+    if (slots.size() != order.size() || slots.empty()) return;
+    storageBegin();
+    for (size_t s = 0; s < slots.size(); s++)
+        srvWrite(slots[s], ids[order[s]], items[order[s]]);
+    srvError("");
+    storageEnd();
+    srvAck();
+}
+
 /** Connect the peer with this id. wifi-style: the collection knows ids, the
  *  existing tcp.cmd.connect sentinel knows slots, so translate here. */
 static void onPeerConnect(const char* key, const char* val)
@@ -959,34 +1140,6 @@ static void peerEnsureIds(void)
     storageEnd();
 }
 
-/** One-time move of the slot-keyed secret store (secrets.tcp.peers.<slot>) to
- *  the id-keyed one. Best effort: it assumes slots have not shifted since the
- *  slot-keyed store was written, which holds for any store the slot-keyed
- *  firmware wrote (it had no remove-compaction or reorder). The old subtree
- *  goes away regardless, so this runs once. */
-static void peerMigrateSecrets(void)
-{
-    if (!storageExists("secrets.tcp.peers")) return;
-    int n = storageArrayCount("s.tcp.peers");
-    storageBegin();
-    for (int i = 0; i < n; i++) {
-        char k[80];
-        std::snprintf(k, sizeof k, "secrets.tcp.peers.%d.ifac_netkey", i);
-        std::string v = storageGetStr(k, "");
-        /* peerEnsureIds ran just above, but its writes are still in the actor's
-         * queue — reads see the committed tree. Compute the id it assigns
-         * (slot + 1) rather than reading it back. */
-        std::string id = peerField(i, "id");
-        if (id.empty()) id = std::to_string(i + 1);
-        if (v.empty()) continue;
-        std::snprintf(k, sizeof k, "secrets.tcp.peer_ifac.%s", id.c_str());
-        storageSet(k, v.c_str());
-    }
-    storageDeleteTree("secrets.tcp.peers");
-    storageEnd();
-    info("tcp: moved peer IFAC secrets to the id-keyed store");
-}
-
 /* ─────────────── inbound TCP server ───────────────
  *
  * peerModeName is defined down in the CLI section; forward-declare it so the
@@ -995,16 +1148,33 @@ static void peerMigrateSecrets(void)
 static const char* peerModeName(uint8_t m);
 
 /*
- * One TCP listener (registered with net on s.tcp.server_port) accepting up to
- * s.tcp.max_inbound connections. Each accepted connection becomes its own rnsd
+ * The Incoming Ports collection (s.tcp.servers): up to TCP_MAX_SERVERS TCP
+ * listeners, each its own net endpoint, together accepting up to
+ * TCP_MAX_INBOUND connections. Each accepted connection becomes its own rnsd
  * interface "tcp_in/<addr>#<slot>", framed identically to the outbound peers
- * (HDLC) and carrying the server's mode + IFAC. Runs on the same tcp task. */
+ * (HDLC) and carrying its server's mode, community radius + IFAC. Runs on the
+ * same tcp task. */
+
+struct server_t {
+    char     idstr[12];          /* collection id — stable across reorders */
+    bool     enabled;
+    uint16_t port;
+    uint8_t  mode;
+    int      max_conns;          /* per-port connection ceiling */
+    uint8_t  community_radius;   /* serve nodes within this many hops; 0 = none */
+    uint8_t  ifac_size;
+    uint8_t  announce_cap;
+    char     ifac_netname[32];
+    char     ifac_netkey[64];
+    char     nvsKey[16];         /* net endpoint identity: "tcp_srv_<id>" */
+};
 
 struct inbound_peer_t {
     bool     used;
     int      net_handle;     /* ITS server handle (TCP byte stream from net) */
     int      rnsd_handle;    /* ITS handle to rnsd (RNS packet stream) */
     uint8_t  mode;
+    int      srv;            /* index into s_servers at accept time */
     char     addr[48];       /* client "ip" label */
 
     /* HDLC inbound assembly — same field names as peer_t so hdlcConsume<>
@@ -1025,16 +1195,12 @@ struct inbound_peer_t {
 
 PSRAM_BSS static inbound_peer_t s_inbound[TCP_MAX_INBOUND];
 
-static bool     s_serverEnable = false;
-static uint16_t s_serverPort   = 4965;
-static uint8_t  s_serverMode   = RNS_IFACE_MODE_GATEWAY;
-static int      s_maxInbound   = TCP_MAX_INBOUND;
-static char     s_serverIfacNetname[32] = "";
-static char     s_serverIfacNetkey[64]  = "";
-static uint8_t  s_serverIfacSize        = 0;
-static uint8_t  s_serverAnnounceCap     = RNS_IFACE_ANNOUNCE_CAP_DEFAULT;
-static uint8_t  s_serverRetainAnnounces = 0;
-static bool     s_serverRegistered      = false;
+static server_t s_servers[TCP_MAX_SERVERS];
+static int      s_serverCount = 0;
+/* Every nvsKey ever pushed to net this boot: a removed server's endpoint must
+ * be closed by name (tcpPort 0), or net keeps its socket open forever. */
+static char     s_regKeys[TCP_MAX_SERVERS * 2][16];
+static int      s_regKeyCount = 0;
 
 static uint8_t modeFromStr(const char* m) {
     if      (strcmp(m, "full")         == 0) return RNS_IFACE_MODE_FULL;
@@ -1042,12 +1208,17 @@ static uint8_t modeFromStr(const char* m) {
     else if (strcmp(m, "access_point") == 0) return RNS_IFACE_MODE_ACCESS_POINT;
     else if (strcmp(m, "roaming")      == 0) return RNS_IFACE_MODE_ROAMING;
     else if (strcmp(m, "boundary")     == 0) return RNS_IFACE_MODE_BOUNDARY;
-    return RNS_IFACE_MODE_GATEWAY;
+    return RNS_IFACE_MODE_ACCESS_POINT;
 }
 
 static int inboundActiveCount(void) {
     int n = 0;
     for (auto& ip : s_inbound) if (ip.used) n++;
+    return n;
+}
+static int inboundActiveCountFor(int srv) {
+    int n = 0;
+    for (auto& ip : s_inbound) if (ip.used && ip.srv == srv) n++;
     return n;
 }
 static inbound_peer_t* inboundByNetHandle(int h) {
@@ -1060,22 +1231,44 @@ static inbound_peer_t* inboundByRnsdHandle(int h) {
 }
 
 static void loadServerConfig(void) {
-    s_serverEnable = storageGetInt("s.tcp.server_enable", 0) != 0;
-    s_serverPort   = (uint16_t)storageGetInt("s.tcp.server_port", 4965);
-    char mode[24] = "gateway";
-    storageGetStr("s.tcp.server_mode", mode, sizeof(mode), "gateway");
-    s_serverMode = modeFromStr(mode);
-    int mi = storageGetInt("s.tcp.max_inbound", TCP_MAX_INBOUND);
-    if (mi < 0) mi = 0;
-    if (mi > TCP_MAX_INBOUND) mi = TCP_MAX_INBOUND;
-    s_maxInbound = mi;
-    storageGetStr("s.tcp.server_ifac_netname", s_serverIfacNetname, sizeof(s_serverIfacNetname), "");
-    storageGetStr("secrets.tcp.server_ifac_netkey", s_serverIfacNetkey, sizeof(s_serverIfacNetkey), "");
-    s_serverIfacSize = (uint8_t)storageGetInt("s.tcp.server_ifac_size", 0);
-    s_serverAnnounceCap = (uint8_t)storageGetInt("s.tcp.server_announce_cap", RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
-    /* Same reasoning as an outbound peer: whoever dials in is on the cheap side
-     * of the node, and their announces are someone else's traffic. */
-    s_serverRetainAnnounces = (uint8_t)storageGetInt("s.tcp.server_retain_announces", 0);
+    char key[80];
+    int n = storageArrayCount("s.tcp.servers");
+    if (n > TCP_MAX_SERVERS) n = TCP_MAX_SERVERS;
+    s_serverCount = n;
+    for (int i = 0; i < n; i++) {
+        server_t& sv = s_servers[i];
+        sv = server_t{};
+        char idbuf[7] = "";
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.id", i);
+        storageGetStr(key, idbuf, sizeof(idbuf), "");
+        safeStrncpy(sv.idstr, idbuf, sizeof(sv.idstr));
+        snprintf(sv.nvsKey, sizeof(sv.nvsKey), "tcp_srv_%s", idbuf);
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.enable", i);
+        sv.enabled = storageGetInt(key, 1) != 0;
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.port", i);
+        sv.port = (uint16_t)storageGetInt(key, 4965);
+        char mode[24] = "access_point";
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.mode", i);
+        storageGetStr(key, mode, sizeof(mode), "access_point");
+        sv.mode = modeFromStr(mode);
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.max_conns", i);
+        sv.max_conns = storageGetInt(key, TCP_MAX_INBOUND);
+        if (sv.max_conns < 0) sv.max_conns = 0;
+        if (sv.max_conns > TCP_MAX_INBOUND) sv.max_conns = TCP_MAX_INBOUND;
+        /* Radius 0 by default — same reasoning as an outbound peer: whoever
+         * dials in is on the cheap side of the node, and their announces are
+         * someone else's traffic. */
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.community_radius", i);
+        sv.community_radius = (uint8_t)storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.ifac_netname", i);
+        storageGetStr(key, sv.ifac_netname, sizeof(sv.ifac_netname), "");
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.ifac_netkey", i);
+        storageGetStr(key, sv.ifac_netkey, sizeof(sv.ifac_netkey), "");
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.ifac_size", i);
+        sv.ifac_size = (uint8_t)storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.announce_cap", i);
+        sv.announce_cap = (uint8_t)storageGetInt(key, RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    }
 }
 
 static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
@@ -1120,10 +1313,12 @@ static void onInboundDisconnectNet(int ref) {
     inboundTeardown(ip, "net closed");
 }
 
-static int onInboundConnect(int handle, const void* data, size_t len) {
-    if (!s_serverEnable) return -1;            /* soft-disabled — refuse */
-    if (inboundActiveCount() >= s_maxInbound) {
-        warn("tcp inbound: at capacity (%d), rejecting", s_maxInbound);
+static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
+    if (srv >= s_serverCount) return -1;       /* server removed — refuse */
+    server_t& sv = s_servers[srv];
+    if (!sv.enabled) return -1;                /* soft-disabled — refuse */
+    if (inboundActiveCountFor(srv) >= sv.max_conns) {
+        warn("tcp inbound: port %u at capacity (%d), rejecting", (unsigned)sv.port, sv.max_conns);
         return -1;
     }
     /* The slot index IS the serverRef returned to net AND the ref we hand rnsd,
@@ -1136,7 +1331,8 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     ip.used = true;
     ip.net_handle = handle;
     ip.rnsd_handle = -1;
-    ip.mode = s_serverMode;
+    ip.mode = sv.mode;
+    ip.srv  = srv;
 
     const char* ipstr = "?";
     if (len >= sizeof(net_connect_t)) {
@@ -1149,16 +1345,16 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
     snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
-    reg.mode    = s_serverMode;
+    reg.mode    = sv.mode;
     reg.in = reg.out = 1;
-    reg.fwd = (s_serverMode == RNS_IFACE_MODE_GATEWAY || s_serverMode == RNS_IFACE_MODE_FULL) ? 1 : 0;
+    reg.fwd = (sv.mode == RNS_IFACE_MODE_GATEWAY || sv.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
     reg.rpt = 0;
-    reg.ifac_size = s_serverIfacSize;
-    reg.announce_cap = s_serverAnnounceCap;
+    reg.ifac_size = sv.ifac_size;
+    reg.announce_cap = sv.announce_cap;
     reg.point_to_point = 1;   /* one peer per accepted TCP connection */
-    reg.retain_announces = s_serverRetainAnnounces;
-    safeStrncpy(reg.ifac_netname, s_serverIfacNetname, sizeof(reg.ifac_netname));
-    safeStrncpy(reg.ifac_netkey,  s_serverIfacNetkey,  sizeof(reg.ifac_netkey));
+    reg.community_radius = sv.community_radius;
+    safeStrncpy(reg.ifac_netname, sv.ifac_netname, sizeof(reg.ifac_netname));
+    safeStrncpy(reg.ifac_netkey,  sv.ifac_netkey,  sizeof(reg.ifac_netkey));
 
     ip.rnsd_handle = itsConnect("rnsd", RNSD_PORT_IFACE, &reg, sizeof(reg),
                                 pdMS_TO_TICKS(500), slot, onInboundRnsdRecv, onInboundRnsdDisconnect);
@@ -1167,67 +1363,77 @@ static int onInboundConnect(int handle, const void* data, size_t len) {
         ip.used = false;
         return -1;                              /* net closes the socket */
     }
-    info("tcp inbound: accepted %s as iface %s (mode=%s)", ip.addr, reg.name, peerModeName(s_serverMode));
+    info("tcp inbound: port %u accepted %s as iface %s (mode=%s)",
+         (unsigned)sv.port, ip.addr, reg.name, peerModeName(sv.mode));
     return slot;
 }
 
-/* Push the inbound server's desired listen state to net. The port follows
- * s.tcp.server_port (ownPort => net binds it directly, not via s.net.*); a
- * disabled server sends port 0 so net closes the listen socket entirely — the
- * port opens and closes as the service is enabled and disabled. Re-sending with
- * a new port is how a runtime port change takes effect: net rebinds on its next
- * poll (see epOpenPort). */
-static void serverRegister(void) {
+/* itsServerOnConnect carries no context, so each server slot's ITS port gets
+ * its own trampoline naming the slot. */
+static int onInboundConnect0(int h, const void* d, size_t l) { return onInboundConnect(0, h, d, l); }
+static int onInboundConnect1(int h, const void* d, size_t l) { return onInboundConnect(1, h, d, l); }
+static int onInboundConnect2(int h, const void* d, size_t l) { return onInboundConnect(2, h, d, l); }
+static int onInboundConnect3(int h, const void* d, size_t l) { return onInboundConnect(3, h, d, l); }
+static its_connect_cb_t const s_inboundConnectCbs[TCP_MAX_SERVERS] =
+    { onInboundConnect0, onInboundConnect1, onInboundConnect2, onInboundConnect3 };
+
+static void regKeyRemember(const char* k) {
+    for (int i = 0; i < s_regKeyCount; i++)
+        if (strcmp(s_regKeys[i], k) == 0) return;
+    if (s_regKeyCount < (int)(sizeof(s_regKeys) / sizeof(s_regKeys[0])))
+        safeStrncpy(s_regKeys[s_regKeyCount++], k, sizeof(s_regKeys[0]));
+}
+
+static void serverEndpointPush(const char* nvsKey, int slot, uint16_t port) {
     net_port_msg_t reg = {};
-    reg.itsPort    = TCP_PORT_INBOUND;
+    reg.itsPort    = (uint16_t)(TCP_PORT_INBOUND + slot);
     reg.ownPort    = 1;
-    reg.tcpPort    = s_serverEnable ? s_serverPort : 0;   /* 0 => net closes the socket */
+    reg.tcpPort    = port;    /* 0 => net closes the socket */
     reg.tcpNoDelay = 1;
     reg.keepAlive  = 1;
     reg.backlog    = 4;
-    safeStrncpy(reg.nvsKey, "tcp_server_port", sizeof(reg.nvsKey));
-    if (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500))) {
-        warn("tcp: inbound server net registration failed");
-        return;
+    safeStrncpy(reg.nvsKey, nvsKey, sizeof(reg.nvsKey));
+    if (!itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+        warn("tcp: inbound server net registration failed (%s)", nvsKey);
+}
+
+/* Push every server's desired listen state to net, and close the endpoint of
+ * any server registered earlier this boot but no longer configured. Re-sending
+ * with a new port is how a runtime port change takes effect: net rebinds on
+ * its next poll (see epOpenPort). */
+static void serversRegister(void) {
+    for (int i = 0; i < s_serverCount; i++) {
+        server_t& sv = s_servers[i];
+        serverEndpointPush(sv.nvsKey, i, sv.enabled ? sv.port : 0);
+        regKeyRemember(sv.nvsKey);
     }
-    s_serverRegistered = true;
+    for (int i = 0; i < s_regKeyCount; i++) {
+        bool live = false;
+        for (int j = 0; j < s_serverCount; j++)
+            if (strcmp(s_regKeys[i], s_servers[j].nvsKey) == 0) { live = true; break; }
+        if (!live) serverEndpointPush(s_regKeys[i], 0, 0);
+    }
 }
 
 /* Reconcile server state with config — runs on the tcp task on config change.
  * mode/IFAC are baked at accept time, so a change drops live inbound peers to
  * force them to re-register with the new settings on reconnect. */
 static void reconcileServer(void) {
-    uint8_t oldMode = s_serverMode, oldIfacSize = s_serverIfacSize;
-    uint8_t oldAnnounceCap = s_serverAnnounceCap;
-    uint8_t oldRetain = s_serverRetainAnnounces;
-    uint16_t oldPort = s_serverPort;
-    char oldNetname[sizeof(s_serverIfacNetname)]; safeStrncpy(oldNetname, s_serverIfacNetname, sizeof(oldNetname));
-    char oldNetkey[sizeof(s_serverIfacNetkey)];   safeStrncpy(oldNetkey,  s_serverIfacNetkey,  sizeof(oldNetkey));
-    bool wasEnabled = s_serverEnable;
+    server_t old[TCP_MAX_SERVERS];
+    int oldCount = s_serverCount;
+    memcpy(old, s_servers, sizeof(old));
 
     loadServerConfig();
 
-    bool settingsChanged = s_serverMode != oldMode || s_serverIfacSize != oldIfacSize ||
-        s_serverAnnounceCap != oldAnnounceCap || s_serverRetainAnnounces != oldRetain ||
-        strcmp(s_serverIfacNetname, oldNetname) != 0 || strcmp(s_serverIfacNetkey, oldNetkey) != 0;
-    bool portChanged   = s_serverPort != oldPort;
-    bool enableChanged = wasEnabled != s_serverEnable;
-
-    /* Push desired state to net: open on first enable, then re-push on every
-     * enable/disable or port change so net opens, closes, or rebinds the listen
-     * socket accordingly. A never-enabled server is never registered. */
-    if ((s_serverEnable && !s_serverRegistered) ||
-        (s_serverRegistered && (enableChanged || portChanged)))
-        serverRegister();
-
-    if (enableChanged)
-        info("tcp: inbound server %s", s_serverEnable ? "enabled" : "disabled");
-
-    if (!s_serverEnable) {
-        if (wasEnabled)
-            for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "server stopped");
-    } else if (settingsChanged) {
-        for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "settings changed");
+    /* Registration values (mode, radius, IFAC, cap) are baked at accept time,
+     * so any change in the array drops every live inbound connection and lets
+     * them come back with the new settings. Coarse and correct: inbound peers
+     * redial on their own. */
+    bool changed = oldCount != s_serverCount ||
+                   memcmp(old, s_servers, sizeof(server_t) * (size_t)s_serverCount) != 0;
+    if (changed) {
+        serversRegister();
+        for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "server settings changed");
     }
 }
 
@@ -1285,12 +1491,15 @@ static void cliTcpStatus(void)
         }
     }
 
-    cliPrintf("inbound server: %s", s_serverEnable ? "enabled" : "disabled");
-    if (s_serverEnable)
-        cliPrintf(" port=%u mode=%s active=%d/%d",
-                  (unsigned)s_serverPort, peerModeName(s_serverMode),
-                  inboundActiveCount(), s_maxInbound);
-    cliPrintf("\n");
+    cliPrintf("incoming ports: %d configured\n", s_serverCount);
+    for (int i = 0; i < s_serverCount; i++) {
+        server_t& sv = s_servers[i];
+        cliPrintf("    port %-5u %-13s %-9s active=%d/%d radius=%u\n",
+                  (unsigned)sv.port, peerModeName(sv.mode),
+                  sv.enabled ? "enabled" : "disabled",
+                  inboundActiveCountFor(i), sv.max_conns,
+                  (unsigned)sv.community_radius);
+    }
     for (auto& ip : s_inbound) {
         if (!ip.used) continue;
         cliPrintf("    in  %-24s %-13s rx=%llu tx=%llu\n",
@@ -1306,9 +1515,9 @@ static void cliTcpPeerAdd(const char* rest)
     if (!*rest) { cliPrintf("usage: tcp peer add <host[:port]> [mode]\n"); return; }
     const char* sp = std::strchr(rest, ' ');
     std::string hp = sp ? std::string(rest, sp - rest) : std::string(rest);
-    const char* mode = sp ? sp + 1 : "gateway";
+    const char* mode = sp ? sp + 1 : "access_point";
     while (*mode == ' ') mode++;
-    if (!*mode) mode = "gateway";
+    if (!*mode) mode = "access_point";
 
     /* Split host:port. ':' from the right so IPv6-ish forms could be
      * extended later; for now just simple host:port or bare hostname. */
@@ -1435,8 +1644,7 @@ static void cliTcpPeer(const char* rest)
         /* storageUnset (not storageDeleteTree) so the array element is removed
          * AND the rest shift down, and the s.tcp.peers subscription fires. */
         storageBegin();
-        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n);       storageUnset(k);
-        std::snprintf(k, sizeof(k), "secrets.tcp.peers.%ld", n); storageUnset(k);
+        std::snprintf(k, sizeof(k), "s.tcp.peers.%ld", n); storageUnset(k);
         storageEnd();
         cliPrintf("tcp: removed peer slot %ld\n", n);
         return;
@@ -1467,10 +1675,10 @@ static void cliTcp(const char* args)
     if (cliWantsHelp(args)) {
         cliPrintf("tcp                              list peers + status\n");
         cliPrintf("tcp start | stop | restart       global gate (s.tcp.enable)\n");
-        cliPrintf("tcp server [start|stop]          inbound TCP listener (s.tcp.server_*)\n");
+        cliPrintf("tcp server                       incoming-port status (s.tcp.servers)\n");
         cliPrintf("tcp connect <slot>               force-connect peer (clear backoff)\n");
         cliPrintf("tcp disconnect <slot>            kick peer's connection\n");
-        cliPrintf("tcp peer add <host[:port]> [mode] add a peer (port=4965, mode=gateway)\n");
+        cliPrintf("tcp peer add <host[:port]> [mode] add a peer (port=4965, mode=access_point)\n");
         cliPrintf("tcp peer rm <slot>               remove peer slot\n");
         cliPrintf("tcp peer enable <slot>           persistently enable\n");
         cliPrintf("tcp peer disable <slot>          persistently disable\n");
@@ -1504,14 +1712,7 @@ static void cliTcp(const char* args)
 
     if (verb == "peer") { cliTcpPeer(rest); return; }
 
-    if (verb == "server") {
-        while (*rest == ' ') rest++;
-        if (!*rest)                     { cliTcpStatus(); return; }
-        if (strcmp(rest, "start") == 0) { storageSet("s.tcp.server_enable", 1); cliPrintf("tcp: inbound server enabled\n");  return; }
-        if (strcmp(rest, "stop")  == 0) { storageSet("s.tcp.server_enable", 0); cliPrintf("tcp: inbound server disabled\n"); return; }
-        cliPrintf("usage: tcp server [start|stop]\n");
-        return;
-    }
+    if (verb == "server") { cliTcpStatus(); return; }
 
     cliPrintf("unknown subcommand `%s`. try `tcp -h`.\n", verb.c_str());
 }
@@ -1555,11 +1756,19 @@ static void tcpTaskMain(void*)
      * client. Open the port + handlers regardless of enable so config can flip
      * it on later; the listen socket is registered with net only when enabled. */
     itsServerInit();
-    itsServerPortOpen(TCP_PORT_INBOUND, /*packetBased=*/false, TCP_MAX_INBOUND, 4096, 4096);
-    itsServerOnConnect(TCP_PORT_INBOUND,    onInboundConnect);
-    itsServerOnRecv(TCP_PORT_INBOUND,       onInboundRecv);
-    itsServerOnDisconnect(TCP_PORT_INBOUND, onInboundDisconnectNet);
+    /* One ITS server port per Incoming Ports slot: the port is how a
+     * connection names which listener accepted it (itsServerOnConnect carries
+     * no context). Recv/disconnect resolve the peer by handle, so those
+     * handlers are shared. */
+    for (int i = 0; i < TCP_MAX_SERVERS; i++) {
+        uint16_t port = (uint16_t)(TCP_PORT_INBOUND + i);
+        itsServerPortOpen(port, /*packetBased=*/false, TCP_MAX_INBOUND, 4096, 4096);
+        itsServerOnConnect(port,    s_inboundConnectCbs[i]);
+        itsServerOnRecv(port,       onInboundRecv);
+        itsServerOnDisconnect(port, onInboundDisconnectNet);
+    }
     loadServerConfig();
+    serversRegister();
 
     /* Cache the global gate. Default 1 — no key in storage means "on";
      * user must explicitly set s.tcp.enable=0 to stop. */
@@ -1580,9 +1789,7 @@ static void tcpTaskMain(void*)
     }
 
     storageSubscribeChanges("s.tcp.peers",        onCfgChange);
-    storageSubscribeChanges("secrets.tcp.peers",  onCfgChange);  /* IFAC passphrase */
-    storageSubscribeChanges("s.tcp.server",       onCfgChange);  /* inbound server cfg */
-    storageSubscribeChanges("secrets.tcp.server", onCfgChange);  /* server IFAC passphrase */
+    storageSubscribeChanges("s.tcp.servers",      onCfgChange);  /* incoming-ports cfg */
     storageSubscribeChanges("s.tcp.enable",       onGlobalEnableChange);
     storageSubscribeChanges("tcp.cmd.connect",    onCmdConnect);
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
@@ -1593,12 +1800,15 @@ static void tcpTaskMain(void*)
      * these, and this file is the array's only writer, which is what puts
      * validation in one place and lets a rejection come back as a sentence. */
     peerEnsureIds();
-    peerMigrateSecrets();
     storageSubscribeChanges("tcp.peer.add",     onPeerAdd);
     storageSubscribeChanges("tcp.peer.set",     onPeerSet);
     storageSubscribeChanges("tcp.peer.remove",  onPeerRemove);
     storageSubscribeChanges("tcp.peer.order",   onPeerOrder);
     storageSubscribeChanges("tcp.peer.connect", onPeerConnect);
+    storageSubscribeChanges("tcp.server.add",    onSrvAdd);
+    storageSubscribeChanges("tcp.server.set",    onSrvSet);
+    storageSubscribeChanges("tcp.server.remove", onSrvRemove);
+    storageSubscribeChanges("tcp.server.order",  onSrvOrder);
 
     /* Clock was already resolved by rnsd before it declared ready (its own
      * waitForTime + boot window ran first), so we don't wait again here.
@@ -1671,15 +1881,9 @@ static void tcpTaskMain(void*)
         if (p.net_handle  >= 0) { itsDisconnect(p.net_handle);  p.net_handle  = -1; }
     }
     for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "tcp stopping");
-    if (s_serverRegistered) {
-        net_port_msg_t reg = {};
-        reg.itsPort = TCP_PORT_INBOUND;
-        reg.ownPort = 1;
-        reg.tcpPort = 0;   /* 0 => net closes the listen socket */
-        safeStrncpy(reg.nvsKey, "tcp_server_port", sizeof(reg.nvsKey));
-        itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500));
-        s_serverRegistered = false;
-    }
+    for (int i = 0; i < s_regKeyCount; i++)
+        serverEndpointPush(s_regKeys[i], 0, 0);   /* 0 => net closes the socket */
+    s_regKeyCount = 0;
     std::vector<peer_t>().swap(s_peers);
 
     s_parked = true;
@@ -1710,15 +1914,11 @@ void TcpService::onInit()
 {
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
         storageBegin();
-        storageDefault("s.tcp.server_enable", 0);
-        storageDefault("s.tcp.server_port", 4965);
-        storageDefault("s.tcp.server_mode", "gateway");
-        storageDefault("s.tcp.max_inbound", TCP_MAX_INBOUND);
-        /* Seed the peers list as an ARRAY. Without it the first `s.tcp.peers.0.*`
+        /* Seed both lists as ARRAYS. Without it the first `s.tcp.peers.0.*`
          * write lands as an object keyed "0" — a patch tree is nested objects and
          * there is no array underneath to merge element-wise into. Every reader
          * here counts either shape, but the tree goes to the browser verbatim. */
-        storageDefaultTree("s.tcp", "{\"peers\":[]}");
+        storageDefaultTree("s.tcp", "{\"peers\":[],\"servers\":[]}");
         storageSet("s.tcp.version", TCP_VERSION);
         storageEnd();
     }

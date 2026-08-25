@@ -95,35 +95,34 @@ the browser.
 | Key | Default | Meaning |
 |---|---|---|
 | `enable` | `0` | Per-peer on/off. (`tcp peer add` writes `1`.) |
+| `name` | `""` | Display name shown in the peer list; `host:port` when empty. |
 | `host` | `""` | Hostname or IPv4 of the peer's TCP server. |
 | `port` | `4965` | TCP port (Reticulum's default). |
-| `mode` | `gateway` | Interface mode: `full`/`gateway`/`access_point`/`roaming`/`boundary`. |
+| `mode` | `access_point` | Interface mode: `full`/`gateway`/`access_point`/`roaming`/`boundary`. |
 | `ifac_netname` | `""` | IFAC network name. `""` = open interface. |
 | `ifac_size` | `0` | IFAC access-code length in bytes. `0` = default (1). |
-| `retain_announces` | `0` | Keep the announces heard on this peer, not just forward them. Off by default: a TCP peer into the wider network delivers everyone's announces, unbounded, and re-acquiring any of them costs one path request over a cheap link — so rnsd keeps only what was resolved on demand, claimed, or is in active use. Turn it on for a peer that is your own infrastructure. |
-| `policy_manual` | `0` | Set this peer's transit policy by hand instead of inferring it from `mode`. Off = auto, which is stock behaviour and leaves `route_for` unread. |
-| `route_for` | `0` | Read only when `policy_manual = 1`. `1` = we provide transport for the nodes reachable through this peer: we relay announces towards them, we search on their behalf, and their paths get `s.rnsd.path.ttl_custody`. `0` = their traffic is not our business — the usual setting for an uplink into the wider network. Answering a path request for a destination we already know is never gated by this. See `rns/README.md`. |
+| `community_radius` | `0` | Community Radius: nodes within this many hops via this peer are served — their announces kept and answered for, searches run on their behalf. `0` (default) treats the peer as an uplink: a TCP peer into the wider network delivers everyone's announces, unbounded, so rnsd keeps only what was resolved on demand, claimed, or is in active use. Raise it for a peer fronting a segment this node should serve. See `rns/README.md`. |
 | `retry_min` | `2` | Reconnect backoff floor, seconds. |
 | `retry_max` | `300` | Reconnect backoff ceiling, seconds (clamped to ≥ `retry_min`). |
 
-**Inbound server** — `s.tcp.*`
+**Incoming Ports** — `s.tcp.servers.<i>.*` (a collection like the peers; up to 4 listeners)
 
 | Key | Default | Meaning |
 |---|---|---|
-| `s.tcp.server_enable` | `0` | Accept inbound TCP connections. Live: enabling opens the listen socket, disabling closes it (no reboot). |
-| `s.tcp.server_port` | `4965` | Listen port. Live: changing it re-binds the socket (no reboot). |
-| `s.tcp.server_mode` | `gateway` | Mode applied to every accepted interface. |
-| `s.tcp.max_inbound` | `8` | Concurrent inbound connection cap (hard ceiling 8). |
-| `s.tcp.server_ifac_netname` | `""` | IFAC network name for accepted connections. |
-| `s.tcp.server_ifac_size` | `0` | IFAC access-code length. `0` = default (1). |
-| `s.tcp.server_retain_announces` | `0` | Keep announces heard on accepted connections. Off by default for the same reason as an outbound peer: whoever dials in is on the cheap side of this node. |
+| `enable` | `1` | Per-port on/off. Live: enabling opens the listen socket, disabling closes it (no reboot). |
+| `port` | `4965` | Listen port. Live: changing it re-binds the socket (no reboot). Must be unique among the listeners. |
+| `mode` | `access_point` | Mode applied to every interface accepted on this port. |
+| `max_conns` | `8` | Concurrent connection cap for this port (hard ceiling 8 across all ports). |
+| `community_radius` | `0` | Community Radius for callers on this port; `0` (default) treats them as uplinks. |
+| `ifac_netname` | `""` | IFAC network name for accepted connections. |
+| `ifac_size` | `0` | IFAC access-code length. `0` = default (1). |
 
 ### Secrets
 
 | Key | Meaning |
 |---|---|
-| `secrets.tcp.peers.<id>.ifac_netkey` | IFAC passphrase for outbound peer `<id>`. `""` = open. |
-| `secrets.tcp.server_ifac_netkey` | IFAC passphrase for the inbound server. `""` = open. |
+| `s.tcp.peers.<n>.ifac_netkey` | IFAC passphrase for that outbound peer. `""` = open. An ordinary field of the item, masked where it is shown — a code the other end was given is one an operator has to be able to read back. |
+| `s.tcp.servers.<n>.ifac_netkey` | IFAC passphrase for that incoming port. `""` = open. |
 
 ### Runtime telemetry (written)
 
@@ -153,12 +152,12 @@ Single-shot triggers the tcp task consumes and unsets:
 ## CLI
 
 ```
-tcp                               list peers + inbound-server status
+tcp                               list peers + incoming-port status
 tcp start | stop | restart        global gate (s.tcp.enable) / redial all
-tcp server [start|stop]           inbound TCP listener (s.tcp.server_enable)
+tcp server                        incoming-port status (s.tcp.servers)
 tcp connect <slot>                force-connect a peer (clears backoff)
 tcp disconnect <slot>             kick a peer's connection
-tcp peer add <host[:port]> [mode] add a peer (port 4965, mode gateway)
+tcp peer add <host[:port]> [mode] add a peer (port 4965, mode access_point)
 tcp peer rm <slot>                remove a peer slot
 tcp peer enable <slot>            persistently enable a peer
 tcp peer disable <slot>           persistently disable a peer

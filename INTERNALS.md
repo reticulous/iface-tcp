@@ -16,8 +16,9 @@ existing ITS services ([spangap-net](../spangap-net) for TCP, [rns](../rns)'s
 - **Outbound peer table** (`std::vector<peer_t> s_peers`) with a per-peer
   connect/backoff state machine, host:port-stable reconnect across config
   reloads, and the net-upstream dial gate.
-- **Inbound TCP server** — one listener (`TCP_PORT_INBOUND` registered with net)
-  accepting up to `s.tcp.max_inbound` connections, each a fresh RNS interface.
+- **Incoming Ports** (`s.tcp.servers`, up to `TCP_MAX_SERVERS` listeners
+  registered with net) — accepted connections, up to `max_conns` per port and
+  `TCP_MAX_INBOUND` overall, each a fresh RNS interface.
 - **Per-interface IFAC + mode plumbing** — reads the credentials from storage
   and fills `rnsd_iface_t`; the crypto enforcement itself lives in `rnsd` /
   microReticulum.
@@ -179,21 +180,26 @@ seeded from `netIsStaConnected()` then driven by the events (which only flip the
 in `servicePeers`). On an upstream-up edge `s_netEdge` is set so the loop clears
 accrued backoff and redials promptly instead of waiting it out.
 
-## 6. Inbound TCP server
+## 6. Incoming Ports
 
-One listener serves all inbound connections; `s_inbound[TCP_MAX_INBOUND]`
-(PSRAM, 8 slots) holds the accepted ones. The ITS server port `TCP_PORT_INBOUND`
-(0x5443) is opened unconditionally at boot so config can flip the server on
-later; the TCP listen socket is registered with `net` while the server is
-enabled and closed when it's disabled.
+The `s.tcp.servers` collection describes up to `TCP_MAX_SERVERS` listeners,
+sharing one accepted-connection pool; `s_inbound[TCP_MAX_INBOUND]`
+(PSRAM, 8 slots) holds the accepted ones. One ITS server port per listener
+slot (`TCP_PORT_INBOUND` + slot, 0x5443…) is opened unconditionally at boot —
+the port is how a connection names which listener accepted it, since
+`itsServerOnConnect` carries no context; recv/disconnect resolve the peer by
+handle and are shared. The TCP listen sockets are registered with `net` per
+`s.tcp.servers` entry while enabled and closed when disabled or removed.
 
-`serverRegister()` sends a `net_port_msg_t` on `NET_PORT_REG_PORT` with
-`ownPort=1` and `tcpPort = s.tcp.server_enable ? s.tcp.server_port : 0`, so net
-binds `s.tcp.server_port` directly (not via `s.net.*`) and a disabled server
-sends `tcpPort=0`, which closes the listen socket. Re-sending is how both a
-port change and an enable/disable take effect: net rebinds or closes on its next
-poll (see net's `epOpenPort`), no reboot. The port opens and closes as the
-service is enabled and disabled — a disabled server has no bound socket, not a
+`serversRegister()` sends a `net_port_msg_t` on `NET_PORT_REG_PORT` per entry
+with `ownPort=1`, `nvsKey = "tcp_srv_<id>"` and `tcpPort = enabled ? port : 0`,
+so net binds each port directly (not via `s.net.*`) and a disabled entry
+sends `tcpPort=0`, which closes its listen socket; an entry removed from the
+collection is closed by name through the remembered-key list (`s_regKeys`).
+Re-sending is how both a port change and an enable/disable take effect: net
+rebinds or closes on its next
+poll (see net's `epOpenPort`), no reboot. A port opens and closes as its entry
+is enabled and disabled — a disabled listener has no bound socket, not a
 socket that accepts then refuses.
 
 `onInboundConnect` allocates the lowest free slot (refusing with `-1` when the
@@ -214,7 +220,8 @@ registered.
 ## 7. IFAC
 
 iface-tcp reads three values per interface — `ifac_netname` (`s.*`),
-`ifac_netkey` passphrase (`secrets.*`), and `ifac_size` (`s.*`) — and copies
+`ifac_netkey` passphrase, and `ifac_size` — all three ordinary fields of the
+item — and copies
 them into `rnsd_iface_t.{ifac_netname,ifac_netkey,ifac_size}` at register time.
 That is the whole of its IFAC involvement.
 
@@ -244,9 +251,10 @@ remaining entries down and fires the `s.tcp.peers` subscription — so a removal
 reflows the array and refreshes every UI. `del` compacts the parallel
 `secrets.tcp.peers` array in step.
 
-`tcp start`/`stop` and `tcp server start`/`stop` write `s.tcp.enable` /
-`s.tcp.server_enable` directly (not sentinels); the global gate change is
-handled by `onGlobalEnableChange`, which tears down or brings back all peers.
+`tcp start`/`stop` writes `s.tcp.enable` directly (not a sentinel); the global
+gate change is handled by `onGlobalEnableChange`, which tears down or brings
+back all peers. The incoming-port entries are enabled per item through the
+`tcp.server.*` collection sentinels.
 
 ## 9. Telemetry publishing
 

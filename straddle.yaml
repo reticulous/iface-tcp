@@ -27,21 +27,22 @@ services:
 settings:
   - at:
       - { id: reticulum }
-      - { id: tcp, label: "TCP", short: "TCP", order: 3 }
+      - { id: interfaces }
+    order: 3
     rows:
-      - section: "Outgoing"
+      - heading: "TCP"
+      - section: "Outbound peers"
       - caption: "Dial public RNS TCP servers or other Reticulum nodes by host:port. Each peer registers as its own RNS interface."
       - list:
-          label: "Peers"
           key: s.tcp.peers
           id: id
-          item: "{host}:{port}"
-          subtitle: "{mode}"
+          item: "{display}"
+          subtitle: "{host}:{port}"
           # tcp.cpp publishes each peer's pill — the words and the colour a
           # connection state deserves are its judgement, not a UI's.
           status: "tcp.peer.{id}"
           empty: "No peers configured."
-          orderable: true
+          reorder: true
           cmd: tcp.peer
           add:
             - label: "Add peer"
@@ -49,54 +50,76 @@ settings:
                 title: "Add peer"
                 submit: "Add"
                 fields:
+                  - text: { label: "Name", field: name, placeholder: "shown in the list; host:port if empty" }
                   - text: { label: "Host", field: host }
-                  - text: { label: "Port", field: port, default: "4965" }
-          remove: { confirm: "Remove {host}:{port}?" }
+                  - integer: { label: "Port", field: port, min: 1, max: 65535, default: 4965 }
+          remove: { confirm: "Remove {display}?" }
           actions:
             - { label: "Connect", do: { set: { key: "tcp.peer.connect", value: "{id}" } } }
           edit:
             - switch:   { label: "Enabled", field: enable }
+            - text:     { label: "Name", field: name, placeholder: "shown in the list; host:port if empty" }
             - text:     { label: "Host", field: host }
-            - text:     { label: "Port", field: port }
-            - dropdown:
-                label: "Mode"
-                field: mode
-                options:
-                  - { v: "gateway",      l: "Gateway" }
-                  - { v: "full",         l: "Full" }
-                  - { v: "access_point", l: "Access point" }
-                  - { v: "roaming",      l: "Roaming" }
-                  - { v: "boundary",     l: "Boundary" }
-            - section: "Announces"
-            - caption: "Off: what this peer announces is forwarded but not kept, and a destination is re-acquired with a path request when something wants it. On for a peer that is your own infrastructure — a peer into the wider network delivers everyone's announces, unbounded."
-            - switch: { label: "Keep announces", field: retain_announces }
-            - section: "Access code"
-            - caption: "IFAC: a network name + passphrase that must match this peer's, or traffic is dropped. Leave blank for an open interface."
-            - text: { label: "IFAC network", field: ifac_netname }
-            # Write-only: tcp.cpp routes it to an id-keyed secret store, never
-            # into the peer object, and an empty submit leaves it unchanged.
-            - text: { label: "IFAC passphrase", field: ifac_netkey, secret: true, placeholder: "unchanged if left empty" }
-            - section: "Retry"
-            - text: { label: "Min backoff (s)", field: retry_min, placeholder: "2" }
-            - text: { label: "Max backoff (s)", field: retry_max, placeholder: "300" }
-      - section: "Incoming"
-      - caption: "Accept inbound TCP connections — other Reticulum nodes dial this device on the listen port. Each accepted connection becomes its own RNS interface."
-      - switch: { label: "Enabled", key: "s.tcp.server_enable" }
-      - text:   { label: "Listen port", key: "s.tcp.server_port" }
-      - dropdown:
-          label: "Mode"
-          key: "s.tcp.server_mode"
-          options:
-            - { v: "full",         l: "Full" }
-            - { v: "gateway",      l: "Gateway" }
-            - { v: "access_point", l: "Access point" }
-            - { v: "roaming",      l: "Roaming" }
-            - { v: "boundary",     l: "Boundary" }
-      - text: { label: "Max inbound", key: "s.tcp.max_inbound" }
-      - section: "Announces"
-      - caption: "Keep the announces heard on accepted connections. Off for the same reason as an outbound peer: whoever dials in is on the cheap side of this node."
-      - switch: { label: "Keep announces", key: "s.tcp.server_retain_announces" }
-      - section: "Access code"
-      - caption: "IFAC for accepted connections: a network name + passphrase that dialing peers must match, or their traffic is dropped."
-      - text: { label: "IFAC network", key: "s.tcp.server_ifac_netname" }
-      - text: { label: "IFAC passphrase", key: "secrets.tcp.server_ifac_netkey", secret: true }
+            - integer:  { label: "Port", field: port, min: 1, max: 65535 }
+            - advanced:
+                rows:
+                  - dropdown:
+                      label: "Interface mode"
+                      field: mode
+                      options:
+                        - { v: "access_point", l: "Access point" }
+                        - { v: "gateway",      l: "Gateway" }
+                        - { v: "full",         l: "Full" }
+                        - { v: "roaming",      l: "Roaming" }
+                        - { v: "boundary",     l: "Boundary" }
+                  - integer: { label: "Community Radius", field: community_radius, min: 0, max: 7 }
+                  - caption: "Nodes within this many hops via this peer are yours: their announces are kept and answered for, and searches run on their behalf. 0 (default) treats the peer as an uplink: on-demand only."
+                  - integer: { label: "Min backoff", unit: "s", field: retry_min, min: 1, max: 3600 }
+                  - integer: { label: "Max backoff", unit: "s", field: retry_max, min: 1, max: 86400 }
+                  - section: "Interface access code (IFAC)"
+                  - caption: "A network name + passphrase that must match this peer's, or traffic is dropped. Leave blank for an open interface."
+                  - text: { label: "IFAC network", field: ifac_netname }
+                  # An ordinary field of the peer, masked where it is shown:
+                  # this is the code the other end was given, and an operator
+                  # who cannot read back what they typed cannot tell why the
+                  # link is silent.
+                  - text: { label: "IFAC passphrase", field: ifac_netkey, secret: true }
+      - section: "Incoming ports"
+      - caption: "Accept inbound TCP connections — other Reticulum nodes dial this device on a listen port. Each accepted connection becomes its own RNS interface."
+      - list:
+          key: s.tcp.servers
+          id: id
+          item: "Port {port}"
+          subtitle: "{mode}"
+          empty: "No listen ports configured."
+          reorder: true
+          cmd: tcp.server
+          add:
+            - label: "Add port"
+              form:
+                title: "Add listen port"
+                submit: "Add"
+                fields:
+                  - integer: { label: "Port", field: port, min: 1, max: 65535, default: 4965 }
+          remove: { confirm: "Remove listener on port {port}?" }
+          edit:
+            - switch: { label: "Enabled", field: enable }
+            - integer: { label: "Port", field: port, min: 1, max: 65535 }
+            - advanced:
+                rows:
+                  - dropdown:
+                      label: "Interface mode"
+                      field: mode
+                      options:
+                        - { v: "access_point", l: "Access point" }
+                        - { v: "gateway",      l: "Gateway" }
+                        - { v: "full",         l: "Full" }
+                        - { v: "roaming",      l: "Roaming" }
+                        - { v: "boundary",     l: "Boundary" }
+                  - integer: { label: "Max connections", field: max_conns, min: 0, max: 8 }
+                  - integer: { label: "Community Radius", field: community_radius, min: 0, max: 7 }
+                  - caption: "Nodes within this many hops via this port are yours: their announces are kept and answered for, and searches run on their behalf. 0 (default) treats callers as uplinks: on-demand only."
+                  - section: "Interface access code (IFAC)"
+                  - caption: "A network name + passphrase dialing peers must match, or their traffic is dropped. Leave blank for an open port."
+                  - text: { label: "IFAC network", field: ifac_netname }
+                  - text: { label: "IFAC passphrase", field: ifac_netkey, secret: true }
