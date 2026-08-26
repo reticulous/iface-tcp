@@ -196,11 +196,20 @@ with `ownPort=1`, `nvsKey = "tcp_srv_<id>"` and `tcpPort = enabled ? port : 0`,
 so net binds each port directly (not via `s.net.*`) and a disabled entry
 sends `tcpPort=0`, which closes its listen socket; an entry removed from the
 collection is closed by name through the remembered-key list (`s_regKeys`).
-Re-sending is how both a port change and an enable/disable take effect: net
-rebinds or closes on its next
+Re-sending is how a port change, an enable/disable and a move of the
+internet-reachable switch all take effect: net rebinds or closes on its next
 poll (see net's `epOpenPort`), no reboot. A port opens and closes as its entry
 is enabled and disabled — a disabled listener has no bound socket, not a
 socket that accepts then refuses.
+
+The same message carries `publicFacing = enabled && upnp`, the entry's
+**Accessible from internet** switch. It is the entry's whole contribution to
+port forwarding: net records the flag, reports the flagged ports that are open
+through `netPublicPorts()`, and [upnp](../upnp) — if it is in the build at all —
+maps them. This file names no port mapper and includes no header of one; the
+switch is `when_kconfig`-gated on `CONFIG_SPANGAP_UPNP` in `straddle.yaml`, so a
+build without upnp has no row, while `loadServerConfig()` still reads the field
+(defaulting to 1) and passes it on regardless.
 
 `onInboundConnect` allocates the lowest free slot (refusing with `-1` when the
 server is disabled or at `s_maxInbound`), reads the client IP from the

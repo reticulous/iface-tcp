@@ -11,7 +11,9 @@
  *
  * Inbound: the s.tcp.servers[] collection (Incoming Ports) registers one TCP
  * listener with net per entry; each accepted client becomes its own rnsd
- * iface "tcp_in/<addr>#<slot>", framed identically.
+ * iface "tcp_in/<addr>#<slot>", framed identically. A listener's `upnp` field
+ * rides that registration as net's publicFacing flag, which is how a port
+ * mapper learns to forward it in from the internet.
  */
 #include "tcp.h"
 #include "rnsd.h"         /* rnsServiceRegister, rnsd_iface_t, RNSD_PORT_IFACE */
@@ -93,6 +95,11 @@ static TaskHandle_t s_task = nullptr;
 static volatile bool s_stop = false;   /* rns stop → break the task loop and park */
 static volatile bool s_parked = false; /* true while parked (stopped); tcpStop waits on it */
 static TickType_t s_nextPublishTick = 0;   /* throttles periodic stats publish to ~1 Hz */
+
+/* This straddle's RNS announce beat (rnsdAnnounceBeat state). One beat for
+ * every TCP connection, in and out: the schedule belongs to the medium, and
+ * they all share it. */
+static uint32_t   s_annNextMs = 0;
 
 static peer_t* peerByRuntimeId(int rid) {
     for (auto& p : s_peers) if (p.runtime_id == rid) return &p;
@@ -673,6 +680,17 @@ static void onCmdDisconnect(const char* key, const char* val)
     }
 }
 
+/* "Announce now" button. Hosted on the storage task: the handler is one
+ * fire-and-forget aux to rnsd, and the `tcp` prefix covers every registration
+ * this straddle holds — `tcp/<n>` outbound and `tcp_in/<addr:port>` inbound —
+ * so it needs neither this task nor the peer vector. */
+static void onAnnounceNow(const char* key, const char* val)
+{
+    if (!val || atoi(val) == 0) return;   /* the edge write's leading 0 is not a press */
+    storageUnset(key);
+    rnsdIfaceAnnounceNow("tcp");
+}
+
 static void onCmdRestart(const char* key, const char* val)
 {
     if (!val || !*val) return;
@@ -927,7 +945,7 @@ static void onPeerOrder(const char* key, const char* val)
  * item forever; the array is compacted on delete. */
 
 static const char* const SERVER_FIELDS[] =
-    { "id", "enable", "port", "mode", "max_conns",
+    { "id", "enable", "upnp", "port", "mode", "max_conns",
       "community_radius", "ifac_netname", "ifac_netkey", "announce_cap" };
 
 static std::string srvField(int idx, const char* field)
@@ -1158,6 +1176,7 @@ static const char* peerModeName(uint8_t m);
 struct server_t {
     char     idstr[12];          /* collection id — stable across reorders */
     bool     enabled;
+    bool     upnp;               /* ask net to publish this port to the internet */
     uint16_t port;
     uint8_t  mode;
     int      max_conns;          /* per-port connection ceiling */
@@ -1245,6 +1264,12 @@ static void loadServerConfig(void) {
         snprintf(sv.nvsKey, sizeof(sv.nvsKey), "tcp_srv_%s", idbuf);
         snprintf(key, sizeof(key), "s.tcp.servers.%d.enable", i);
         sv.enabled = storageGetInt(key, 1) != 0;
+        /* Default on: a listen port exists to be dialed, and the caller a
+         * Reticulum node most wants is the one outside the LAN. Whether
+         * anything comes of it is the router's answer, not ours — in a build
+         * without upnp the flag is simply never read. */
+        snprintf(key, sizeof(key), "s.tcp.servers.%d.upnp", i);
+        sv.upnp = storageGetInt(key, 1) != 0;
         snprintf(key, sizeof(key), "s.tcp.servers.%d.port", i);
         sv.port = (uint16_t)storageGetInt(key, 4965);
         char mode[24] = "access_point";
@@ -1384,11 +1409,13 @@ static void regKeyRemember(const char* k) {
         safeStrncpy(s_regKeys[s_regKeyCount++], k, sizeof(s_regKeys[0]));
 }
 
-static void serverEndpointPush(const char* nvsKey, int slot, uint16_t port) {
+static void serverEndpointPush(const char* nvsKey, int slot, uint16_t port,
+                               bool publicFacing) {
     net_port_msg_t reg = {};
     reg.itsPort    = (uint16_t)(TCP_PORT_INBOUND + slot);
     reg.ownPort    = 1;
     reg.tcpPort    = port;    /* 0 => net closes the socket */
+    reg.publicFacing = publicFacing ? 1 : 0;
     reg.tcpNoDelay = 1;
     reg.keepAlive  = 1;
     reg.backlog    = 4;
@@ -1404,14 +1431,15 @@ static void serverEndpointPush(const char* nvsKey, int slot, uint16_t port) {
 static void serversRegister(void) {
     for (int i = 0; i < s_serverCount; i++) {
         server_t& sv = s_servers[i];
-        serverEndpointPush(sv.nvsKey, i, sv.enabled ? sv.port : 0);
+        serverEndpointPush(sv.nvsKey, i, sv.enabled ? sv.port : 0,
+                           sv.enabled && sv.upnp);
         regKeyRemember(sv.nvsKey);
     }
     for (int i = 0; i < s_regKeyCount; i++) {
         bool live = false;
         for (int j = 0; j < s_serverCount; j++)
             if (strcmp(s_regKeys[i], s_servers[j].nvsKey) == 0) { live = true; break; }
-        if (!live) serverEndpointPush(s_regKeys[i], 0, 0);
+        if (!live) serverEndpointPush(s_regKeys[i], 0, 0, /*publicFacing=*/false);
     }
 }
 
@@ -1425,16 +1453,26 @@ static void reconcileServer(void) {
 
     loadServerConfig();
 
-    /* Registration values (mode, radius, IFAC, cap) are baked at accept time,
-     * so any change in the array drops every live inbound connection and lets
-     * them come back with the new settings. Coarse and correct: inbound peers
-     * redial on their own. */
     bool changed = oldCount != s_serverCount ||
                    memcmp(old, s_servers, sizeof(server_t) * (size_t)s_serverCount) != 0;
-    if (changed) {
-        serversRegister();
-        for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "server settings changed");
+    if (!changed) return;
+    serversRegister();
+
+    /* Registration values (mode, radius, IFAC, cap) are baked at accept time,
+     * so a change in the array drops every live inbound connection and lets
+     * them come back with the new settings. Coarse and correct: inbound peers
+     * redial on their own. `upnp` is the exception — it is not baked into
+     * anything, it rides the net registration just sent, and dropping a caller
+     * already through the door to publish that door to the internet would be a
+     * cost with nothing bought. */
+    bool sessionChanged = oldCount != s_serverCount;
+    for (int i = 0; !sessionChanged && i < s_serverCount; i++) {
+        server_t a = old[i], b = s_servers[i];
+        a.upnp = b.upnp = false;
+        sessionChanged = memcmp(&a, &b, sizeof(server_t)) != 0;
     }
+    if (sessionChanged)
+        for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "server settings changed");
 }
 
 /* ─────────────── CLI ─────────────── */
@@ -1795,6 +1833,7 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.cmd.disconnect", onCmdDisconnect);
     storageSubscribeChanges("tcp.cmd.restart",    onCmdRestart);
     storageSubscribeChanges("tcp.cmd.del",        onCmdDel);
+    storageSubscribeChanges("tcp.announce_now",   onAnnounceNow);
 
     /* The settings collection. The UI never writes s.tcp.peers — it writes
      * these, and this file is the array's only writer, which is what puts
@@ -1865,6 +1904,15 @@ static void tcpTaskMain(void*)
             s_nextPublishTick = pubNow + pdMS_TO_TICKS(1000);
         }
 
+        /* Say who we are, on this interface's own schedule. ONE beat for every
+         * connection this straddle holds, outbound peers and inbound alike:
+         * the schedule is a property of the medium, and every connection here
+         * runs over the same one. A connection made mid-interval needs nothing
+         * from this — it registers as its own interface and rnsd replays onto
+         * a fresh registration. Read live so an edit needs no reconnect. */
+        rnsdAnnounceBeat(&s_annNextMs,
+                         storageGetInt("s.tcp.announce_interval", 30), "tcp");
+
         itsPoll(nextDeadline());
     }
 
@@ -1882,7 +1930,8 @@ static void tcpTaskMain(void*)
     }
     for (auto& ip : s_inbound) if (ip.used) inboundTeardown(ip, "tcp stopping");
     for (int i = 0; i < s_regKeyCount; i++)
-        serverEndpointPush(s_regKeys[i], 0, 0);   /* 0 => net closes the socket */
+        serverEndpointPush(s_regKeys[i], 0, 0,    /* 0 => net closes the socket */
+                           /*publicFacing=*/false);
     s_regKeyCount = 0;
     std::vector<peer_t>().swap(s_peers);
 

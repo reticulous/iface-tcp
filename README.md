@@ -89,6 +89,7 @@ the browser.
 | Key | Default | Meaning |
 |---|---|---|
 | `s.tcp.enable` | `1` | Global gate. When `0`, every peer is disconnected regardless of per-peer enable. Live (no reboot). |
+| `s.tcp.announce_interval` | `30` | How often this node says who it is: rnsd replays every hosted destination's announce onto **every** connection this straddle holds on this beat, jittered ±10 %. Minutes. One setting for all of them, outbound `tcp/<n>` and inbound `tcp_in/<addr:port>` alike — they are the same medium, and a connection is not a thing an operator wants to schedule separately. A connection made mid-interval is told who we are as it registers. `0` = never on this interface's own account. Live. See [rns/README.md](../rns/README.md), "The announce beat". |
 
 **Per outbound peer** — `s.tcp.peers.<id>.*` (array index `<id>`)
 
@@ -111,6 +112,7 @@ the browser.
 |---|---|---|
 | `enable` | `1` | Per-port on/off. Live: enabling opens the listen socket, disabling closes it (no reboot). |
 | `port` | `4965` | Listen port. Live: changing it re-binds the socket (no reboot). Must be unique among the listeners. |
+| `upnp` | `1` | **Accessible from internet** — ask the router to forward this port in from the WAN at the same external port, so a Reticulum node outside the LAN can dial it. The flag rides the port's registration with [spangap-net](../spangap-net) as `publicFacing`; [upnp](../upnp) is what acts on it, and the switch appears in the pane only in a build that stages upnp. On by default: a listen port is there to be dialed. |
 | `mode` | `access_point` | Mode applied to every interface accepted on this port. |
 | `max_conns` | `8` | Concurrent connection cap for this port (hard ceiling 8 across all ports). |
 | `community_radius` | `0` | Community Radius for callers on this port; `0` (default) treats them as uplinks. |
@@ -148,6 +150,7 @@ Single-shot triggers the tcp task consumes and unsets:
 | `tcp.cmd.disconnect` | slot | Drop a peer's connection (auto-reconnect still applies). |
 | `tcp.cmd.restart` | any | Tear down every peer connection; enabled peers redial. |
 | `tcp.cmd.del` | slot | Remove a peer slot (compacts the array). |
+| `tcp.announce_now` | any | Ask rnsd to replay every hosted destination's announce onto every TCP connection, in and out now — the pane's **Announce now** button. |
 
 ## CLI
 
