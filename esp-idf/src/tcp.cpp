@@ -312,6 +312,32 @@ static void loadPeerConfig(peer_t& p, int id)
 
 static std::string peerField(int idx, const char* field);   /* the collection store, below */
 
+/* Accepted inbound connections — defined with the inbound table further down. */
+static int inboundActiveCount(void);
+
+/* The status-bar pill: `T` and how many connections this node holds, outbound
+ * and inbound added together — on this medium a peer IS a connection, and the
+ * two directions are the same interface class from a status line's point of
+ * view.
+ *
+ * Shown only where at least one outbound peer is configured AND enabled. TCP's
+ * global gate defaults on and a listen port is passive, so keying the pill on
+ * either would put a permanent `T0` on every node in the fleet, most of which
+ * never dial anything. An enabled outbound peer is somebody stating an
+ * intention to be connected — and `T0` then says exactly the thing worth
+ * saying: configured, and not coming up. */
+static void publishPill(void)
+{
+    bool wanted = false;
+    int conns = 0;
+    for (auto& p : s_peers) {
+        if (p.enabled) wanted = true;
+        if (p.state == PS_UP) conns++;
+    }
+    if (!wanted || !s_globalEnable) { rnsdPillClear("tcp"); return; }
+    rnsdPillSet("tcp", 'T', conns + inboundActiveCount(), "ff5555", 3);
+}
+
 static void publishPeerState(peer_t& p)
 {
     char key[64];
@@ -344,6 +370,7 @@ static void publishPeerState(peer_t& p)
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.tx_bytes", p.id); storageSet(key, (int)(p.bytes_out & 0x7fffffff));
     snprintf(key, sizeof(key), "tcp.peers.%d.stats.rx_bytes", p.id); storageSet(key, (int)(p.bytes_in  & 0x7fffffff));
     storageEnd();
+    publishPill();
 }
 
 /* ─────────────── connection lifecycle ─────────────── */
@@ -447,6 +474,13 @@ static void attemptConnect(peer_t& p)
 
     rnsd_iface_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp/%d", p.id);
+    /* Who is at the far end, for the neighbourhood listing to show until this
+     * peer's first announce names it. The registered name is a slot number; the
+     * dialled address is what an operator knows the peer by. */
+    /* The host is bounded by the field it came from and the label by ITS field,
+     * so the precision is stated rather than left to the truncation: a hostname
+     * long enough to reach it loses its tail, never the port. */
+    snprintf(reg.peer_label, sizeof(reg.peer_label), "%.40s:%u", p.host, (unsigned)p.port);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = p.mode;
@@ -626,6 +660,7 @@ static void reloadPeers(void) {
     }
 
     s_peers = std::move(next);
+    publishPill();      /* a peer added, removed or switched off moves the pill */
 }
 
 /* ─────────────── command handlers (sentinels) ───────────────
@@ -641,6 +676,7 @@ static void onGlobalEnableChange(const char* /*key*/, const char* val)
     if (enabled == s_globalEnable) return;
     s_globalEnable = enabled;
     info("tcp: globally %s", s_globalEnable ? "enabled" : "disabled");
+    publishPill();
     s_configDirty = true;
     if (s_task) xTaskNotifyGive(s_task);
 }
@@ -1303,6 +1339,7 @@ static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
     ip.rx_drop_open = false;
     if (ip.used) info("tcp inbound: %s closed (%s)", ip.addr, reason);
     ip.used = false;
+    publishPill();
 }
 
 static void onInboundRnsdRecv(int handle, size_t /*bytesAvail*/) {
@@ -1368,6 +1405,8 @@ static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
 
     rnsd_iface_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
+    snprintf(reg.peer_label, sizeof(reg.peer_label), "%s (in :%u)",
+             ipstr, (unsigned)sv.port);
     reg.mtu     = RNS_MTU;
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = sv.mode;
@@ -1390,6 +1429,7 @@ static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
     }
     info("tcp inbound: port %u accepted %s as iface %s (mode=%s)",
          (unsigned)sv.port, ip.addr, reg.name, peerModeName(sv.mode));
+    publishPill();
     return slot;
 }
 
@@ -1721,8 +1761,13 @@ static void cliTcp(const char* args)
         cliPrintf("tcp peer enable <slot>           persistently enable\n");
         cliPrintf("tcp peer disable <slot>          persistently disable\n");
         cliPrintf("tcp peer mode <slot> <mode>      full|gateway|access_point|roaming|boundary\n");
+        cliPrintf("tcp n[eighbors] [-v]             direct RNS peers, per connection\n");
         return;
     }
+    /* The peer table above is the CONNECTIONS; this is who is one hop away over
+     * them. `tcp` matches the inbound registrations (`tcp_in/…`) too — they are
+     * the same medium and an operator asking about TCP means all of it. */
+    if (rnsdPeersCli(args, "tcp", "TCP")) return;
 
     const char* sp = std::strchr(args, ' ');
     std::string verb = sp ? std::string(args, sp - args) : std::string(args);

@@ -140,6 +140,12 @@ Per outbound peer, refreshed at ~1 Hz:
 Inbound connections are not mirrored to storage; their state and byte counters
 are shown by `tcp` (CLI) only.
 
+And one key for the whole class:
+
+| Key | Meaning |
+|---|---|
+| `rns.pill.tcp.*` | The top status line's TCP pill (red `ff5555`, order 3), written through rnsd: `T` and how many connections this node holds, outbound and inbound added together — on this medium a peer IS a connection, and the two directions are one interface class from a status line's point of view. Shown only while at least one **outbound peer** is configured and enabled: the global gate defaults on and a listen port is passive, so keying the pill on either would put a permanent `T0` on every node in the fleet, most of which never dial anything. An enabled outbound peer is somebody stating an intention to be connected — and `T0` then says exactly the thing worth saying: configured, and not coming up. See [rns/README](../rns/README.md#status-line-pills). |
+
 ### Command sentinels (write, self-clearing)
 
 Single-shot triggers the tcp task consumes and unsets:
@@ -165,7 +171,19 @@ tcp peer rm <slot>                remove a peer slot
 tcp peer enable <slot>            persistently enable a peer
 tcp peer disable <slot>           persistently disable a peer
 tcp peer mode <slot> <mode>       full|gateway|access_point|roaming|boundary
+tcp n[eighbors] [-v]              direct RNS peers, per connection
 ```
+
+`tcp` lists the CONNECTIONS; `tcp n` lists who is one hop away over them —
+inbound connections included, since they are the same medium. Each connection is
+its own point-to-point interface, so the connection **is** the node: one numbered
+block per connection with its destinations under it, labelled by the address
+(`peer_label`, the dialled `host:port` or the accepted peer's address) rather
+than by the registration name, which is a slot number. The table is rnsd's,
+shared by every interface straddle, so a peer on a radius-0 connection is
+deliberately not tracked: an uplink's far end is a route, not a neighbourhood,
+and `n` says so rather than showing an empty list. See
+[rns/README](../rns/README.md#the-neighbourhood--who-is-one-hop-away).
 
 `tcp disconnect` is an ad-hoc kick: the peer goes to backoff and reconnects if
 still enabled. `tcp peer disable` is persistent — it writes
