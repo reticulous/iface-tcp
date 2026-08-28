@@ -326,6 +326,14 @@ static int inboundActiveCount(void);
  * never dial anything. An enabled outbound peer is somebody stating an
  * intention to be connected — and `T0` then says exactly the thing worth
  * saying: configured, and not coming up. */
+/* The colour and the placement are the MEDIUM's and are stated from boot: the
+ * network graph draws TCP links between other nodes on a device that dials
+ * nothing itself, and those lines are still TCP. The pill stays governed by the
+ * rule above. */
+#define TCP_PILL_COLOR "ff5555"
+#define TCP_PILL_ORDER 3
+#define TCP_PILL_TITLE "TCP"
+
 static void publishPill(void)
 {
     bool wanted = false;
@@ -335,7 +343,7 @@ static void publishPill(void)
         if (p.state == PS_UP) conns++;
     }
     if (!wanted || !s_globalEnable) { rnsdPillClear("tcp"); return; }
-    rnsdPillSet("tcp", 'T', conns + inboundActiveCount(), "ff5555", 3);
+    rnsdPillSet("tcp", 'T', conns + inboundActiveCount(), TCP_PILL_COLOR, TCP_PILL_ORDER);
 }
 
 static void publishPeerState(peer_t& p)
@@ -2006,6 +2014,8 @@ static void tcpStop(void) {
 
 void TcpService::onInit()
 {
+    rnsdPillColor("tcp", TCP_PILL_COLOR, TCP_PILL_ORDER, TCP_PILL_TITLE);
+
     if (storageGetInt("s.tcp.version", 0) < TCP_VERSION) {
         storageBegin();
         /* Seed both lists as ARRAYS. Without it the first `s.tcp.peers.0.*`
