@@ -132,7 +132,7 @@ settings:
                   - text: { label: "IFAC network", field: ifac_netname }
                   - text: { label: "IFAC passphrase", field: ifac_netkey, secret: true }
       # How often this node says who it is is a property of the MEDIUM, so it
-      # lives on each interface and not on any application: lxmf, rnsh and rlpg
+      # lives on each interface and not on any application: lxmf, rnsh and lxmproxy
       # keep their announce current with rnsd and never schedule anything.
       #
       # One setting for every connection this straddle holds, outbound peers
