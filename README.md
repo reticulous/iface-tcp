@@ -89,7 +89,7 @@ the browser.
 | Key | Default | Meaning |
 |---|---|---|
 | `s.tcp.enable` | `1` | Global gate. When `0`, every peer is disconnected regardless of per-peer enable. Live (no reboot). |
-| `s.tcp.announce_interval` | `30` | How often this node says who it is: rnsd replays every hosted destination's announce onto **every** connection this straddle holds on this beat, jittered ±10 %. Minutes. One setting for all of them, outbound `tcp/<n>` and inbound `tcp_in/<addr:port>` alike — they are the same medium, and a connection is not a thing an operator wants to schedule separately. A connection made mid-interval is told who we are as it registers. `0` = never on this interface's own account. Live. See [rns/README.md](../rns/README.md), "The announce beat". |
+| `s.tcp.announce_interval` | `30` | How often this node says who it is: rnsd replays every hosted destination's announce onto **every** connection this straddle holds on this beat, jittered ±10 %. Minutes. One setting for all of them, outbound `tcp/<n>` and inbound `tcp_in/<addr:port>` alike — they are the same medium, and a connection is not a thing an operator wants to schedule separately. A connection made mid-interval is told who we are as it registers. `0` = never on this interface's own account. Live. See [rns/README.md](../rns/README.md), "The announce tick". |
 
 **Per outbound peer** — `s.tcp.peers.<id>.*` (array index `<id>`)
 
@@ -102,7 +102,7 @@ the browser.
 | `mode` | `access_point` | Interface mode: `full`/`gateway`/`access_point`/`roaming`/`boundary`. |
 | `ifac_netname` | `""` | IFAC network name. `""` = open interface. |
 | `ifac_size` | `0` | IFAC access-code length in bytes. `0` = default (1). |
-| `community_radius` | `0` | Community Radius: nodes within this many hops via this peer are served — their announces kept and answered for, searches run on their behalf. `0` (default) treats the peer as an uplink: a TCP peer into the wider network delivers everyone's announces, unbounded, so rnsd keeps only what was resolved on demand, claimed, or is in active use. Raise it for a peer fronting a segment this node should serve. See `rns/README.md`. |
+| `community_radius` | `0` | Service radius: nodes within this many hops via this peer are served — their announces kept and answered for, searches run on their behalf. `0` (default) treats the peer as an uplink: a TCP peer into the wider network delivers everyone's announces, unbounded, so rnsd keeps only what was resolved on demand, claimed, or is in active use. Raise it for a peer fronting a segment this node should serve. See `rns/README.md`. |
 | `retry_min` | `2` | Reconnect backoff floor, seconds. |
 | `retry_max` | `300` | Reconnect backoff ceiling, seconds (clamped to ≥ `retry_min`). |
 
@@ -115,7 +115,7 @@ the browser.
 | `upnp` | `1` | **Accessible from internet** — ask the router to forward this port in from the WAN at the same external port, so a Reticulum node outside the LAN can dial it. The flag rides the port's registration with [spangap-net](../spangap-net) as `publicFacing`; [upnp](../upnp) is what acts on it, and the switch appears in the pane only in a build that stages upnp. On by default: a listen port is there to be dialed. |
 | `mode` | `access_point` | Mode applied to every interface accepted on this port. |
 | `max_conns` | `8` | Concurrent connection cap for this port (hard ceiling 8 across all ports). |
-| `community_radius` | `0` | Community Radius for callers on this port; `0` (default) treats them as uplinks. |
+| `community_radius` | `0` | Service radius for callers on this port; `0` (default) treats them as uplinks. |
 | `ifac_netname` | `""` | IFAC network name for accepted connections. |
 | `ifac_size` | `0` | IFAC access-code length. `0` = default (1). |
 
@@ -146,7 +146,7 @@ And one key for the whole class:
 |---|---|
 | `rns.pill.tcp.*` | The top status line's TCP pill (red `ff5555`, order 3), written through rnsd: `T` and how many connections this node holds, outbound and inbound added together — on this medium a peer IS a connection, and the two directions are one interface class from a status line's point of view. Shown only while at least one **outbound peer** is configured and enabled: the global gate defaults on and a listen port is passive, so keying the pill on either would put a permanent `T0` on every node in the fleet, most of which never dial anything. An enabled outbound peer is somebody stating an intention to be connected — and `T0` then says exactly the thing worth saying: configured, and not coming up. See [rns/README](../rns/README.md#status-line-pills). |
 
-### Command sentinels (write, self-clearing)
+### Command keys (write, self-clearing)
 
 Single-shot triggers the tcp task consumes and unsets:
 
@@ -200,7 +200,7 @@ announce retention, IFAC and retry backoff, drag or up/down reorder, live status
 pills) and the inbound-server section, identical on both. The add form asks for
 host and port only; everything else about a peer is set in its editor.
 
-The UI never writes `s.tcp.peers`. Every mutation is a `tcp.peer.*` sentinel and
+The UI never writes `s.tcp.peers`. Every mutation is a `tcp.peer.*` command key and
 `tcp.cpp` is the array's only writer, so the host and port checks exist once and
 a rejection comes back as a sentence on `tcp.peer.error`. Each peer carries an
 `id` that survives the compaction a delete performs, because the collection

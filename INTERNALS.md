@@ -23,9 +23,9 @@ existing ITS services ([spangap-net](../spangap-net) for TCP, [rns](../rns)'s
   and fills `rnsd_iface_t`; the crypto enforcement itself lives in `rnsd` /
   microReticulum.
 - **The `tcp` CLI**, the live `tcp.peers.<id>.*` telemetry, and the
-  `tcp.cmd.*` command sentinels.
+  `tcp.cmd.*` command keys.
 - **The settings pane**, described declaratively in `straddle.yaml` and lowered
-  by the build to both surfaces, plus the `tcp.peer.*` sentinels behind it.
+  by the build to both surfaces, plus the `tcp.peer.*` command keys behind it.
 
 ```
 iface-tcp/
@@ -248,7 +248,7 @@ the iface rx counters keep rising but nothing decodes and no announces cross.
 Also check the rejection matrix: an IFAC-enabled peer pointed at an open
 server (and vice versa) must pass no traffic.
 
-## 8. Command sentinels
+## 8. Command keys
 
 `tcp.cmd.connect` / `disconnect` / `restart` / `del` are storage keys the task
 subscribes to; each handler runs on the tcp task, acts, then `storageUnset`s its
@@ -260,10 +260,10 @@ remaining entries down and fires the `s.tcp.peers` subscription — so a removal
 reflows the array and refreshes every UI. `del` compacts the parallel
 `secrets.tcp.peers` array in step.
 
-`tcp start`/`stop` writes `s.tcp.enable` directly (not a sentinel); the global
+`tcp start`/`stop` writes `s.tcp.enable` directly (not a command key); the global
 gate change is handled by `onGlobalEnableChange`, which tears down or brings
 back all peers. The incoming-port entries are enabled per item through the
-`tcp.server.*` collection sentinels.
+`tcp.server.*` collection command keys.
 
 ## 9. Telemetry publishing
 
@@ -282,7 +282,7 @@ There is no pane code. `straddle.yaml`'s `settings:` block describes the whole
 thing and the build lowers it to the browser tree, the on-device tree and the
 storage defaults. What tcp.cpp owns is the other half of the contract:
 
-- **The peer collection's sentinels** — `tcp.peer.add` / `.set` / `.remove` /
+- **The peer collection's command keys** — `tcp.peer.add` / `.set` / `.remove` /
   `.order` / `.connect`. The UI never writes `s.tcp.peers`; this file does, and
   only in response to one of these, which is why the host and port checks
   (`peerRejection`) exist once and answer on `tcp.peer.error` rather than being
