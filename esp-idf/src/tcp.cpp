@@ -493,8 +493,6 @@ static void attemptConnect(peer_t& p)
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = p.mode;
     reg.in = reg.out = 1;
-    reg.fwd = (p.mode == RNS_IFACE_MODE_GATEWAY || p.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
-    reg.rpt = 0;
     reg.ifac_size = p.ifac_size;
     reg.announce_cap = p.announce_cap;
     reg.point_to_point = 1;   /* one peer per TCP link — no hidden nodes */
@@ -1419,8 +1417,6 @@ static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = sv.mode;
     reg.in = reg.out = 1;
-    reg.fwd = (sv.mode == RNS_IFACE_MODE_GATEWAY || sv.mode == RNS_IFACE_MODE_FULL) ? 1 : 0;
-    reg.rpt = 0;
     reg.ifac_size = sv.ifac_size;
     reg.announce_cap = sv.announce_cap;
     reg.point_to_point = 1;   /* one peer per accepted TCP connection */

@@ -139,8 +139,8 @@ PS_IDLE ── attemptConnect ──► PS_CONNECTING ── ok ──► PS_UP
 `attemptConnect(p)` dials `net` (`NET_PORT_TCP_DIAL`, 12 s timeout), then opens
 the `rnsd` interface (`RNSD_PORT_IFACE`, 500 ms). The `rnsd_iface_t` it sends
 names the interface `tcp/<id>`, sets `mtu = RNS_MTU` (500), `bitrate = 1000000`
-(1 Mbps — feeds RNS's first-hop link-timeout calc), `in = out = 1`,
-`fwd = (mode == gateway || full)`, `rpt = 0`, and the peer's mode + IFAC fields.
+(1 Mbps — feeds RNS's first-hop link-timeout calc), `in = out = 1`, and the
+peer's mode + IFAC fields.
 On success the peer goes `PS_UP` and `cur_backoff_s` resets to 0.
 
 `disconnectPeer(p, reason)` closes both handles, resets HDLC assembly, and moves
