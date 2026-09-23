@@ -124,7 +124,7 @@ settings:
                         - { v: "full",         l: "Full" }
                         - { v: "roaming",      l: "Roaming" }
                         - { v: "boundary",     l: "Boundary" }
-                  - integer: { label: "Max connections", field: max_conns, min: 0, max: 8 }
+                  - integer: { label: "Max connections", field: max_conns, min: 0, max: 16 }
                   - integer: { label: "Community Radius", field: community_radius, min: 0, max: 7 }
                   - caption: "Nodes within this many hops via this port are yours: their announces are kept and answered for, and searches run on their behalf. 0 (default) treats callers as uplinks: on-demand only."
                   - section: "Interface access code (IFAC)"

@@ -114,7 +114,7 @@ the browser.
 | `port` | `4965` | Listen port. Live: changing it re-binds the socket (no reboot). Must be unique among the listeners. |
 | `upnp` | `1` | **Accessible from internet** — ask the router to forward this port in from the WAN at the same external port, so a Reticulum node outside the LAN can dial it. The flag rides the port's registration with [spangap-net](../spangap-net) as `publicFacing`; [upnp](../upnp) is what acts on it, and the switch appears in the pane only in a build that stages upnp. On by default: a listen port is there to be dialed. |
 | `mode` | `access_point` | Mode applied to every interface accepted on this port. |
-| `max_conns` | `8` | Concurrent connection cap for this port (hard ceiling 8 across all ports). |
+| `max_conns` | `16` | Concurrent connection cap for this port (hard ceiling 16 across all ports). |
 | `community_radius` | `0` | Service radius for callers on this port; `0` (default) treats them as uplinks. |
 | `ifac_netname` | `""` | IFAC network name for accepted connections. |
 | `ifac_size` | `0` | IFAC access-code length. `0` = default (1). |

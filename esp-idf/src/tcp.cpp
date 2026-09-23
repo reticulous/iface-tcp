@@ -36,7 +36,7 @@ static const char* TAG = "tcp";
 
 #define TCP_VERSION    3
 #define TCP_MAX_PEERS  16
-#define TCP_MAX_INBOUND 8        /* hard cap on concurrent inbound connections */
+#define TCP_MAX_INBOUND 16       /* hard cap on concurrent inbound connections */
 #define TCP_MAX_SERVERS 4        /* incoming-port listeners (s.tcp.servers) */
 #define TCP_PORT_INBOUND 0x5443  /* ITS server port for accepted inbound conns */
 #define HDLC_FLAG      0x7E
@@ -1897,6 +1897,24 @@ static void tcpTaskMain(void*)
     storageSubscribeChanges("tcp.server.set",    onSrvSet);
     storageSubscribeChanges("tcp.server.remove", onSrvRemove);
     storageSubscribeChanges("tcp.server.order",  onSrvOrder);
+
+    /* A command written before this task was up — a setup script's `set
+     * tcp.server.add {…}` seconds after boot — sits in the store unanswered,
+     * since a subscription sees only what changes after it. Apply whatever is
+     * waiting now; each handler unsets its key as it goes. */
+    {
+        struct { const char* key; storage_change_cb_t cb; } pending[] = {
+            { "tcp.peer.add",     onPeerAdd },    { "tcp.peer.set",      onPeerSet },
+            { "tcp.peer.remove",  onPeerRemove }, { "tcp.peer.order",    onPeerOrder },
+            { "tcp.peer.connect", onPeerConnect },
+            { "tcp.server.add",   onSrvAdd },     { "tcp.server.set",    onSrvSet },
+            { "tcp.server.remove", onSrvRemove }, { "tcp.server.order",  onSrvOrder },
+        };
+        for (auto& p : pending) {
+            std::string v = storageGetStr(p.key, "");
+            if (!v.empty()) p.cb(p.key, v.c_str());
+        }
+    }
 
     /* Clock was already resolved by rnsd before it declared ready (its own
      * waitForTime + boot window ran first), so we don't wait again here.

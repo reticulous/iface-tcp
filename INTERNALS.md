@@ -184,7 +184,7 @@ accrued backoff and redials promptly instead of waiting it out.
 
 The `s.tcp.servers` collection describes up to `TCP_MAX_SERVERS` listeners,
 sharing one accepted-connection pool; `s_inbound[TCP_MAX_INBOUND]`
-(PSRAM, 8 slots) holds the accepted ones. One ITS server port per listener
+(PSRAM, 16 slots) holds the accepted ones. One ITS server port per listener
 slot (`TCP_PORT_INBOUND` + slot, 0x5443…) is opened unconditionally at boot —
 the port is how a connection names which listener accepted it, since
 `itsServerOnConnect` carries no context; recv/disconnect resolve the peer by
