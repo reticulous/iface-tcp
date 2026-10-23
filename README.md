@@ -101,7 +101,7 @@ the browser.
 | `port` | `4965` | TCP port (Reticulum's default). |
 | `mode` | `access_point` | Interface mode: `full`/`gateway`/`access_point`/`roaming`/`boundary`. |
 | `ifac_netname` | `""` | IFAC network name. `""` = open interface. |
-| `ifac_size` | `0` | IFAC access-code length in bytes. `0` = default (16, matching upstream Reticulum). |
+| `ifac_size` | `0` | IFAC access-code length in bytes. `0` = 16, upstream TCPInterface's default; both ends must agree. |
 | `community_radius` | `0` | Service radius: nodes within this many hops via this peer are served — their announces kept and answered for, searches run on their behalf. `0` (default) treats the peer as an uplink: a TCP peer into the wider network delivers everyone's announces, unbounded, so rnsd keeps only what was resolved on demand, claimed, or is in active use. Raise it for a peer fronting a segment this node should serve. See `rns/README.md`. |
 | `retry_min` | `2` | Reconnect backoff floor, seconds. |
 | `retry_max` | `300` | Reconnect backoff ceiling, seconds (clamped to ≥ `retry_min`). |
@@ -117,7 +117,7 @@ the browser.
 | `max_conns` | `16` | Concurrent connection cap for this port (hard ceiling 16 across all ports). |
 | `community_radius` | `0` | Service radius for callers on this port; `0` (default) treats them as uplinks. |
 | `ifac_netname` | `""` | IFAC network name for accepted connections. |
-| `ifac_size` | `0` | IFAC access-code length. `0` = default (16, matching upstream Reticulum). |
+| `ifac_size` | `0` | IFAC access-code length in bytes. `0` = 16, upstream TCPInterface's default. |
 
 ### Secrets
 
