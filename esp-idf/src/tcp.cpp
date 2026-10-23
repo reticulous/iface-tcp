@@ -61,7 +61,7 @@ struct peer_t {
     uint8_t  mode;
     char     ifac_netname[32];   /* IFAC network_name (s.); "" = open */
     char     ifac_netkey[64];    /* IFAC passphrase; "" = open */
-    uint8_t  ifac_size;          /* IFAC access-code length; 0 = default */
+    uint8_t  ifac_size;          /* IFAC access-code length; 0 = RNS_IFAC_SIZE_PACKET */
     uint8_t  announce_cap;       /* % bandwidth cap for announces; 0 = default */
     uint8_t  community_radius;   /* serve nodes within this many hops via this peer; 0 = none */
     uint32_t retry_min_s;
@@ -493,7 +493,7 @@ static void attemptConnect(peer_t& p)
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = p.mode;
     reg.in = reg.out = 1;
-    reg.ifac_size = p.ifac_size;
+    reg.ifac_size = p.ifac_size ? p.ifac_size : RNS_IFAC_SIZE_PACKET;   /* upstream TCPInterface's default */
     reg.announce_cap = p.announce_cap;
     reg.point_to_point = 1;   /* one peer per TCP link — no hidden nodes */
     reg.community_radius = p.community_radius;
@@ -1417,7 +1417,7 @@ static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
     reg.bitrate = 1000000;  /* 1 Mbps — feeds RNS first-hop link timeout */
     reg.mode    = sv.mode;
     reg.in = reg.out = 1;
-    reg.ifac_size = sv.ifac_size;
+    reg.ifac_size = sv.ifac_size ? sv.ifac_size : RNS_IFAC_SIZE_PACKET;
     reg.announce_cap = sv.announce_cap;
     reg.point_to_point = 1;   /* one peer per accepted TCP connection */
     reg.community_radius = sv.community_radius;

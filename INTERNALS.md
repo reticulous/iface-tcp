@@ -231,7 +231,9 @@ registered.
 iface-tcp reads three values per interface — `ifac_netname` (`s.*`),
 `ifac_netkey` passphrase, and `ifac_size` — all three ordinary fields of the
 item — and copies
-them into `rnsd_iface_t.{ifac_netname,ifac_netkey,ifac_size}` at register time.
+them into `rnsd_iface_t.{ifac_netname,ifac_netkey,ifac_size}` at register time,
+an unset `ifac_size` becoming `RNS_IFAC_SIZE_PACKET` (16, upstream TCPInterface's
+`DEFAULT_IFAC_SIZE`).
 That is the whole of its IFAC involvement.
 
 The actual IFAC transform — deriving the per-interface key, masking and signing
