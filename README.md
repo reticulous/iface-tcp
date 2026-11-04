@@ -41,7 +41,8 @@ HDLC-framed and written to the socket. A dropped TCP connection deregisters the
 interface and the peer reconnects with exponential backoff.
 
 The inbound listener registers a TCP port with `net` (`NET_PORT_REG_PORT`);
-each accepted client becomes an interface named `tcp_in/<addr>#<slot>`, framed
+each accepted client becomes an interface named `tcp_in/<addr>#<n>` (`n` an
+accept count, so a reconnecting host never collides with its old connection), framed
 identically and carrying the server's mode and IFAC.
 
 It starts automatically when the straddle is in the build — `tcpInit` is wired
@@ -89,7 +90,7 @@ the browser.
 | Key | Default | Meaning |
 |---|---|---|
 | `s.tcp.enable` | `1` | Global gate. When `0`, every peer is disconnected regardless of per-peer enable. Live (no reboot). |
-| `s.tcp.announce_interval` | `30` | How often this node says who it is: rnsd replays every hosted destination's announce onto **every** connection this straddle holds on this beat, jittered ±10 %. Minutes. One setting for all of them, outbound `tcp/<n>` and inbound `tcp_in/<addr:port>` alike — they are the same medium, and a connection is not a thing an operator wants to schedule separately. A connection made mid-interval is told who we are as it registers. `0` = never on this interface's own account. Live. See [rns/README.md](../rns/README.md), "The announce tick". |
+| `s.tcp.announce_interval` | `30` | How often this node says who it is: rnsd replays every hosted destination's announce onto **every** connection this straddle holds on this beat, jittered ±10 %. Minutes. One setting for all of them, outbound `tcp/<n>` and inbound `tcp_in/<addr>#<n>` alike — they are the same medium, and a connection is not a thing an operator wants to schedule separately. A connection made mid-interval is told who we are as it registers. `0` = never on this interface's own account. Live. See [rns/README.md](../rns/README.md), "The announce tick". |
 
 **Per outbound peer** — `s.tcp.peers.<id>.*` (array index `<id>`)
 

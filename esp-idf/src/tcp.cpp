@@ -11,7 +11,7 @@
  *
  * Inbound: the s.tcp.servers[] collection (Incoming Ports) registers one TCP
  * listener with net per entry; each accepted client becomes its own rnsd
- * iface "tcp_in/<addr>#<slot>", framed identically. A listener's `upnp` field
+ * iface "tcp_in/<addr>#<n>" (see inboundName), framed identically. A listener's `upnp` field
  * rides that registration as net's publicFacing flag, which is how a port
  * mapper learns to forward it in from the internet.
  */
@@ -43,6 +43,8 @@ static const char* TAG = "tcp";
 #define HDLC_ESC       0x7D
 #define HDLC_ESC_MASK  0x20
 #define RNS_MTU        500
+#define TCP_RX_CHUNK   512       /* net bytes read per itsRecv, held until delivered */
+#define HDLC_MAX_FRAME (RNS_MTU * 2 + 4)   /* every byte escaped + two FLAGs */
 
 enum peer_state_t : uint8_t {
     PS_IDLE = 0,
@@ -78,6 +80,16 @@ struct peer_t {
     size_t   rx_len;
     bool     rx_in_frame;
     bool     rx_escaping;
+
+    /* Net bytes read but not yet delivered while rnsd's link is full — see
+     * pumpIn. rx_stalled marks a complete frame waiting at rx_buf[rx_off]. */
+    uint8_t    rx_buf[TCP_RX_CHUNK];
+    size_t     rx_off;
+    size_t     rx_fill;
+    bool       rx_stalled;
+    TickType_t rx_stall_since;
+    /* rnsd packets left queued because the net stream lacked room — see pumpOut. */
+    bool       tx_blocked;
 
     /* Coalesced rnsd-drop accounting — see noteRnsdDrop. */
     bool       rx_drop_open;    /* a report window is in progress */
@@ -144,13 +156,12 @@ static volatile bool s_netEdge    = false;   /* upstream just came up — clear 
 
 /* ─────────────── HDLC ─────────────── */
 
-/* Write HDLC-framed packet to net handle. Returns true if all bytes sent. */
-static bool hdlcSend(int netHandle, const uint8_t* data, size_t len)
+/* HDLC-frame a packet into buf (HDLC_MAX_FRAME bytes); returns the frame length. */
+static size_t hdlcEncode(const uint8_t* data, size_t len, uint8_t* buf)
 {
-    uint8_t buf[RNS_MTU * 2 + 4];
-    size_t  o = 0;
+    size_t o = 0;
     buf[o++] = HDLC_FLAG;
-    for (size_t i = 0; i < len && o < sizeof(buf) - 2; i++) {
+    for (size_t i = 0; i < len && o < HDLC_MAX_FRAME - 2; i++) {
         uint8_t b = data[i];
         if (b == HDLC_FLAG || b == HDLC_ESC) {
             buf[o++] = HDLC_ESC;
@@ -160,8 +171,46 @@ static bool hdlcSend(int netHandle, const uint8_t* data, size_t len)
         }
     }
     buf[o++] = HDLC_FLAG;
-    size_t sent = itsSend(netHandle, buf, o, pdMS_TO_TICKS(500));
-    return sent == o;
+    return o;
+}
+
+/* Move every queued rnsd packet onto the net stream, framed and coalesced into
+ * as few writes as the stream's free space allows. A packet is taken from rnsd
+ * only while the stream has room for its worst-case frame, so a write is never
+ * partial and the byte stream never carries a torn frame. What does not fit
+ * stays queued in rnsd (tx_blocked) and the task loop retries once the stream
+ * has room for a frame again (itsSetFreeNotify wakes it); nothing here waits.
+ * A packet with no net side to go to is drained and
+ * dropped. */
+template<typename P>
+static void pumpOut(P* p)
+{
+    PSRAM_BSS static uint8_t pkt[RNS_MTU + 16];
+    PSRAM_BSS static uint8_t batch[2048];
+    p->tx_blocked = false;
+    if (p->rnsd_handle < 0) return;
+    if (p->net_handle < 0) {
+        while (itsRecv(p->rnsd_handle, pkt, sizeof(pkt), 0) > 0) {}
+        return;
+    }
+    for (;;) {
+        size_t space = itsSpacesAvailable(p->net_handle);
+        size_t o = 0;
+        bool more = true;
+        while (o + HDLC_MAX_FRAME <= sizeof(batch) && o + HDLC_MAX_FRAME <= space) {
+            size_t n = itsRecv(p->rnsd_handle, pkt, sizeof(pkt), 0);
+            if (n == 0) { more = false; break; }
+            o += hdlcEncode(pkt, n, batch + o);
+            p->bytes_out += n;
+        }
+        if (o) itsSend(p->net_handle, batch, o, 0);   /* fits: space was checked */
+        if (!more) return;
+        if (o == 0) {                                 /* stream full: leave the rest queued */
+            p->tx_blocked = itsBytesAvailable(p->rnsd_handle) > 0;
+            if (p->tx_blocked) itsSetFreeNotify(p->net_handle, HDLC_MAX_FRAME);
+            return;
+        }
+    }
 }
 
 /* ── coalesced rnsd-drop reporting ──
@@ -220,21 +269,35 @@ static void flushRnsdDrops(P* p, bool force = false)
     else             p->rx_drop_open = false;
 }
 
+/* How long a complete inbound frame may wait for room on rnsd's link before it
+ * is dropped. While it waits the task keeps serving the uplink and the net
+ * stream backs up into TCP flow control; past this the frame is stale. */
+static const TickType_t RNSD_STALL_MAX = pdMS_TO_TICKS(100);
+
 /* Decode bytes from net into the peer's pkt buffer. On a complete frame,
- * forward to rnsd as one ITS packet and reset assembly state. Templated so
+ * forward to rnsd as one ITS packet and reset assembly state. Never waits:
+ * when rnsd's link is full it stops at the closing FLAG and returns how many
+ * bytes it consumed, so the caller holds the rest and retries. Templated so
  * both outbound peer_t and inbound_peer_t (identical HDLC fields) can use it. */
 template<typename P>
-static void hdlcConsume(P* p, const uint8_t* in, size_t n)
+static size_t hdlcConsume(P* p, const uint8_t* in, size_t n)
 {
     for (size_t i = 0; i < n; i++) {
         uint8_t b = in[i];
         if (b == HDLC_FLAG) {
             if (p->rx_in_frame && p->rx_len > 0) {
                 /* End of frame — emit to rnsd. */
-                if (p->rnsd_handle >= 0) {
-                    size_t s = itsSend(p->rnsd_handle, p->rx_pkt, p->rx_len, pdMS_TO_TICKS(100));
-                    if (s == 0) noteRnsdDrop(p, p->rx_len);
+                if (p->rnsd_handle >= 0 &&
+                    itsSend(p->rnsd_handle, p->rx_pkt, p->rx_len, 0) == 0) {
+                    TickType_t now = xTaskGetTickCount();
+                    if (!p->rx_stalled) { p->rx_stalled = true; p->rx_stall_since = now; }
+                    if (now - p->rx_stall_since < RNSD_STALL_MAX) {
+                        itsSetFreeNotify(p->rnsd_handle, p->rx_len + 4);   /* + packet header */
+                        return i;
+                    }
+                    noteRnsdDrop(p, p->rx_len);
                 }
+                p->rx_stalled = false;
             }
             p->rx_len = 0;
             p->rx_in_frame = true;
@@ -260,6 +323,64 @@ static void hdlcConsume(P* p, const uint8_t* in, size_t n)
             warn("hdlc: frame > %d B, dropped", RNS_MTU);
         }
     }
+    return n;
+}
+
+/* Serve one connection both ways: deliver held and fresh net bytes to rnsd a
+ * chunk at a time, giving the uplink a turn after every chunk so a fast
+ * inbound stream can never starve it. Bytes rnsd cannot take yet stay in
+ * rx_buf and the rest stays unread in the net stream (TCP flow control does
+ * the remaining backpressure); the task loop retries when rnsd's link has room
+ * for the waiting frame (itsSetFreeNotify) or its RNSD_STALL_MAX is up. The
+ * round cap returns control to itsPoll; unread net bytes redispatch us. */
+template<typename P>
+static void pumpIn(P* p)
+{
+    for (int round = 0; round < 8; round++) {
+        if (p->rx_off < p->rx_fill) {
+            p->rx_off += hdlcConsume(p, p->rx_buf + p->rx_off, p->rx_fill - p->rx_off);
+            if (p->rx_off < p->rx_fill) break;
+        }
+        p->rx_off = p->rx_fill = 0;
+        if (p->net_handle < 0) break;
+        size_t n = itsRecv(p->net_handle, p->rx_buf, sizeof(p->rx_buf), 0);
+        if (n == 0) break;
+        p->bytes_in += n;
+        p->rx_fill = n;
+        pumpOut(p);
+    }
+    pumpOut(p);
+}
+
+/* Drop any held inbound bytes and partial frame (connection teardown). */
+template<typename P>
+static void resetIo(P* p)
+{
+    p->rx_len = 0;
+    p->rx_in_frame = false;
+    p->rx_escaping = false;
+    p->rx_off = p->rx_fill = 0;
+    p->rx_stalled = false;
+    p->tx_blocked = false;
+}
+
+/* Held work the task loop retries: bytes waiting for room on rnsd's link, or
+ * rnsd packets waiting for room on the net stream. Both arm itsSetFreeNotify,
+ * so the room's return wakes the loop. */
+template<typename P>
+static bool ioPending(const P* p)
+{
+    return p->rx_off < p->rx_fill || p->tx_blocked;
+}
+
+/* Ticks until the loop must look at this connection without an ITS wake:
+ * a stalled inbound frame's RNSD_STALL_MAX running out; else portMAX_DELAY. */
+template<typename P>
+static TickType_t ioDeadline(const P* p, TickType_t now)
+{
+    if (!p->rx_stalled || p->rx_off >= p->rx_fill) return portMAX_DELAY;
+    TickType_t waited = now - p->rx_stall_since;
+    return waited < RNSD_STALL_MAX ? RNSD_STALL_MAX - waited : 1;
 }
 
 /* ─────────────── peer config ─────────────── */
@@ -389,9 +510,7 @@ static void disconnectPeer(peer_t& p, const char* reason)
     if (p.net_handle  >= 0) { itsDisconnect(p.net_handle);  p.net_handle  = -1; }
     flushRnsdDrops(&p, /*force=*/true);
     p.rx_drop_open = false;
-    p.rx_len = 0;
-    p.rx_in_frame = false;
-    p.rx_escaping = false;
+    resetIo(&p);
     if (p.state == PS_UP || p.state == PS_CONNECTING) {
         info("peer[%d] %s:%u disconnect: %s", p.id, p.host, (unsigned)p.port, reason);
     }
@@ -424,15 +543,14 @@ static void onNetRecv(int handle, size_t /*bytesAvail*/) {
      * `thread_local` which on ESP-IDF/libgcc pulls in lazy TLS init that
      * has been seen to corrupt FreeRTOS scheduler state at boot. */
     PSRAM_BSS static uint8_t buf[1024];
-    /* Always drain first, then decide what to do with it. Returning before
-     * the itsRecv would leave the bytes in the buffer; ITS would keep
-     * redispatching this callback with nothing consumed → busy spin (WDT). */
-    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
-    if (n == 0) return;
     peer_t* p = peerByNetHandle(handle);
-    if (!p) return;   /* conn outlived its peer — drop the drained bytes */
-    p->bytes_in += n;
-    hdlcConsume(p, buf, n);
+    if (!p) {   /* conn outlived its peer — drain and drop */
+        itsRecv(handle, buf, sizeof(buf), 0);
+        return;
+    }
+    /* May leave bytes unread while rnsd is full; ITS counts that as no
+     * progress and itsPoll blocks instead of spinning on it. */
+    pumpIn(p);
 }
 static void onNetDisconnect(int ref) {
     peer_t* p = peerByRuntimeId(ref);
@@ -442,19 +560,12 @@ static void onNetDisconnect(int ref) {
 }
 static void onRnsdRecv(int handle, size_t /*bytesAvail*/) {
     PSRAM_BSS static uint8_t pkt[RNS_MTU + 16];
-    /* Drain first, then decide. rnsd floods this iface with the network's
-     * announce stream; if we returned before itsRecv whenever the net side
-     * is momentarily down, the packet would sit in the buffer and ITS would
-     * redispatch us forever with nothing consumed → busy spin (WDT). */
-    size_t n = itsRecv(handle, pkt, sizeof(pkt), 0);
-    if (n == 0) return;
     peer_t* p = peerByRnsdHandle(handle);
-    if (!p || p->net_handle < 0) return;   /* can't forward — drop drained pkt */
-    if (!hdlcSend(p->net_handle, pkt, n)) {
-        warn("peer[%d] hdlc send failed", p->id);
+    if (!p) {   /* no peer to forward for — drain and drop */
+        itsRecv(handle, pkt, sizeof(pkt), 0);
         return;
     }
-    p->bytes_out += n;
+    pumpOut(p);
 }
 static void onRnsdDisconnect(int ref) {
     peer_t* p = peerByRuntimeId(ref);
@@ -516,8 +627,19 @@ static void attemptConnect(peer_t& p)
 
 /* ─────────────── task loop ─────────────── */
 
+static TickType_t inboundIoDeadline(TickType_t now);
+
 static TickType_t nextDeadline(void)
 {
+    /* Held inbound bytes or queued outbound packets are woken by the far side
+     * freeing room (itsSetFreeNotify); only a stalled frame's drop time needs
+     * a timed wake. */
+    TickType_t now = xTaskGetTickCount();
+    TickType_t soonest = inboundIoDeadline(now);
+    for (auto& p : s_peers) {
+        TickType_t d = ioDeadline(&p, now);
+        if (d < soonest) soonest = d;
+    }
     /* Nothing dials while upstream is down OR the global gate is off; sleep
      * until an upstream-up / config / enable / cmd notify wakes us (no 1 Hz
      * stats churn either — peer state is static, so the chip can stay in light
@@ -526,9 +648,7 @@ static TickType_t nextDeadline(void)
      * dial — e.g. an idle peer whose attempt tick is already past while the
      * global gate is off — itsPoll(0) would return instantly every loop,
      * spinning the task and starving IDLE0 → task WDT. */
-    if (!s_upstreamUp || !s_globalEnable) return portMAX_DELAY;
-    TickType_t now = xTaskGetTickCount();
-    TickType_t soonest = portMAX_DELAY;
+    if (!s_upstreamUp || !s_globalEnable) return soonest;
     for (auto& p : s_peers) {
         if (!peerDialable(p)) continue;
         if (p.state == PS_BACKOFF || p.state == PS_IDLE) {
@@ -724,7 +844,7 @@ static void onCmdDisconnect(const char* key, const char* val)
 
 /* "Announce now" button. Hosted on the storage task: the handler is one
  * fire-and-forget aux to rnsd, and the `tcp` prefix covers every registration
- * this straddle holds — `tcp/<n>` outbound and `tcp_in/<addr:port>` inbound —
+ * this straddle holds — `tcp/<n>` outbound and `tcp_in/<addr>#<n>` inbound —
  * so it needs neither this task nor the peer vector. */
 static void onAnnounceNow(const char* key, const char* val)
 {
@@ -1211,7 +1331,7 @@ static const char* peerModeName(uint8_t m);
  * The Incoming Ports collection (s.tcp.servers): up to TCP_MAX_SERVERS TCP
  * listeners, each its own net endpoint, together accepting up to
  * TCP_MAX_INBOUND connections. Each accepted connection becomes its own rnsd
- * interface "tcp_in/<addr>#<slot>", framed identically to the outbound peers
+ * interface "tcp_in/<addr>#<n>" (inboundName), framed identically to the outbound peers
  * (HDLC) and carrying its server's mode, community radius + IFAC. Runs on the
  * same tcp task. */
 
@@ -1237,6 +1357,7 @@ struct inbound_peer_t {
     uint8_t  mode;
     int      srv;            /* index into s_servers at accept time */
     char     addr[48];       /* client "ip" label */
+    char     name[sizeof(rnsd_iface_t::name)];   /* registered rnsd iface name */
 
     /* HDLC inbound assembly — same field names as peer_t so hdlcConsume<>
      * works on both. */
@@ -1244,6 +1365,13 @@ struct inbound_peer_t {
     size_t   rx_len;
     bool     rx_in_frame;
     bool     rx_escaping;
+
+    uint8_t    rx_buf[TCP_RX_CHUNK];
+    size_t     rx_off;
+    size_t     rx_fill;
+    bool       rx_stalled;
+    TickType_t rx_stall_since;
+    bool       tx_blocked;
 
     bool       rx_drop_open;
     uint32_t   rx_drops;
@@ -1255,6 +1383,17 @@ struct inbound_peer_t {
 };
 
 PSRAM_BSS static inbound_peer_t s_inbound[TCP_MAX_INBOUND];
+
+static TickType_t inboundIoDeadline(TickType_t now)
+{
+    TickType_t soonest = portMAX_DELAY;
+    for (auto& ip : s_inbound) {
+        if (!ip.used) continue;
+        TickType_t d = ioDeadline(&ip, now);
+        if (d < soonest) soonest = d;
+    }
+    return soonest;
+}
 
 static server_t s_servers[TCP_MAX_SERVERS];
 static int      s_serverCount = 0;
@@ -1338,6 +1477,39 @@ static void loadServerConfig(void) {
     }
 }
 
+/* The rnsd name of a new inbound connection: "tcp_in/<addr>#<n>", n a per-boot
+ * accept count modulo 100, skipping any n whose name a live connection holds.
+ * A closed connection's name may still be registered with rnsd for a moment
+ * (its disconnect is asynchronous), and the next accepts carry other counts.
+ * The "#<n>" is never cut: an address too long for the name loses whole
+ * leading groups instead, marked "..". */
+static void inboundName(const char* addr, char* out, size_t outsz) {
+    static unsigned s_acceptSeq = 0;
+    const size_t addrLen = strlen(addr);
+    for (int tries = 0; tries < 100; tries++) {
+        unsigned n = s_acceptSeq++ % 100;
+        char suffix[4];
+        snprintf(suffix, sizeof suffix, "#%u", n);
+        size_t room = outsz - 1 - strlen("tcp_in/") - strlen(suffix);
+        const char* a = addr;
+        const char* mark = "";
+        if (addrLen > room) {
+            mark = "..";
+            a = addr + (addrLen - (room - 2));
+            /* Cut mid-group: start after the next separator instead. */
+            if (a[-1] != '.' && a[-1] != ':') {
+                const char* sep = strpbrk(a, ".:");
+                if (sep && sep[1]) a = sep + 1;
+            }
+        }
+        snprintf(out, outsz, "tcp_in/%s%s%s", mark, a, suffix);
+        bool taken = false;
+        for (auto& ip : s_inbound)
+            if (ip.used && strcmp(ip.name, out) == 0) { taken = true; break; }
+        if (!taken) return;
+    }
+}
+
 static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
     if (ip.rnsd_handle >= 0) { itsDisconnect(ip.rnsd_handle); ip.rnsd_handle = -1; }
     if (ip.net_handle  >= 0) { itsDisconnect(ip.net_handle);  ip.net_handle  = -1; }
@@ -1350,12 +1522,9 @@ static void inboundTeardown(inbound_peer_t& ip, const char* reason) {
 
 static void onInboundRnsdRecv(int handle, size_t /*bytesAvail*/) {
     PSRAM_BSS static uint8_t pkt[RNS_MTU + 16];
-    size_t n = itsRecv(handle, pkt, sizeof(pkt), 0);
-    if (n == 0) return;
     inbound_peer_t* ip = inboundByRnsdHandle(handle);
-    if (!ip || ip->net_handle < 0) return;
-    if (!hdlcSend(ip->net_handle, pkt, n)) { warn("tcp inbound: hdlc send failed"); return; }
-    ip->bytes_out += n;
+    if (!ip) { itsRecv(handle, pkt, sizeof(pkt), 0); return; }
+    pumpOut(ip);
 }
 static void onInboundRnsdDisconnect(int ref) {
     if (ref < 0 || ref >= TCP_MAX_INBOUND) return;
@@ -1366,12 +1535,9 @@ static void onInboundRnsdDisconnect(int ref) {
 }
 static void onInboundRecv(int handle, size_t /*bytesAvail*/) {
     PSRAM_BSS static uint8_t buf[1024];
-    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
-    if (n == 0) return;
     inbound_peer_t* ip = inboundByNetHandle(handle);
-    if (!ip) return;
-    ip->bytes_in += n;
-    hdlcConsume(ip, buf, n);
+    if (!ip) { itsRecv(handle, buf, sizeof(buf), 0); return; }
+    pumpIn(ip);
 }
 static void onInboundDisconnectNet(int ref) {
     if (ref < 0 || ref >= TCP_MAX_INBOUND) return;
@@ -1410,7 +1576,8 @@ static int onInboundConnect(int srv, int handle, const void* data, size_t len) {
     safeStrncpy(ip.addr, ipstr, sizeof(ip.addr));
 
     rnsd_iface_t reg = {};
-    snprintf(reg.name, sizeof(reg.name), "tcp_in/%s#%d", ipstr, slot);
+    inboundName(ipstr, reg.name, sizeof(reg.name));
+    safeStrncpy(ip.name, reg.name, sizeof(ip.name));
     snprintf(reg.peer_label, sizeof(reg.peer_label), "%s (in :%u)",
              ipstr, (unsigned)sv.port);
     reg.mtu     = RNS_MTU;
@@ -1942,6 +2109,10 @@ static void tcpTaskMain(void*)
                 }
             }
         }
+
+        /* Retry what a full rnsd link or net stream left waiting. */
+        for (auto& p : s_peers) if (ioPending(&p)) pumpIn(&p);
+        for (auto& ip : s_inbound) if (ip.used && ioPending(&ip)) pumpIn(&ip);
 
         servicePeers();
 

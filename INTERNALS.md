@@ -75,17 +75,21 @@ escape:  0x7E → 0x7D 0x5E      0x7D → 0x7D 0x5D
 decode:  scan for FLAG; inside a frame, ESC means XOR the next byte with 0x20
 ```
 
-`hdlcSend(netHandle, data, len)` writes one framed packet in a single `itsSend`
-(500 ms timeout). The stack buffer is sized `RNS_MTU * 2 + 4` — worst case is
-every byte escaped plus the two FLAGs.
+`hdlcEncode(data, len, buf)` frames one packet into `buf` and returns its
+length; `HDLC_MAX_FRAME` (`RNS_MTU * 2 + 4`, every byte escaped plus the two
+FLAGs) is the worst case. It does no I/O: `pumpOut` places the frames.
 
 `hdlcConsume<P>(p, in, n)` is a streaming decoder templated over `peer_t` and
-`inbound_peer_t` (which deliberately share the same `rx_pkt` / `rx_len` /
-`rx_in_frame` / `rx_escaping` field names). On each FLAG it emits a non-empty
-assembled frame to `p->rnsd_handle` as one ITS packet, then resets. A frame
-exceeding `sizeof(rx_pkt)` (`RNS_MTU + 8`) aborts assembly with one `warn` and
-resyncs on the next FLAG. The bytes inside a frame are exactly the RNS packet
-that would go on any other interface — TCP adds only delimitation.
+`inbound_peer_t` (which deliberately share the same HDLC and I/O field names).
+On each FLAG it sends a non-empty assembled frame to `p->rnsd_handle` as one
+ITS packet without waiting, then resets. When rnsd's link is full it stops at
+that closing FLAG and returns how many bytes it consumed, so the caller holds
+the rest; a frame still refused after `RNSD_STALL_MAX` (100 ms) is dropped and
+counted (`noteRnsdDrop`: the first drop of a run logs at once, the rest as one
+line per 5 s window). A frame exceeding `sizeof(rx_pkt)` (`RNS_MTU + 8`) aborts
+assembly with one `warn` and resyncs on the next FLAG. The bytes inside a frame
+are exactly the RNS packet that would go on any other interface — TCP adds only
+delimitation.
 
 ## 4. ITS topology
 
@@ -96,16 +100,41 @@ Each connection holds two ITS handles on the tcp task:
             (TCP bytes)            (RNS packets)
 ```
 
-- **net → rnsd:** `onNetRecv` drains up to 1 KB from `net_handle` and feeds
-  `hdlcConsume`, which emits complete frames to `rnsd_handle`.
-- **rnsd → net:** `onRnsdRecv` reads one RNS packet from `rnsd_handle`,
-  HDLC-encodes it, and `itsSend`s to `net_handle`.
+Nothing on either path waits; every send is non-blocking and backpressure is
+held in state the task loop comes back for.
 
-Both recv callbacks **drain first, then decide**: they always call `itsRecv`
-before any early return. Returning before the recv would leave the bytes
-buffered and ITS would redispatch the callback forever with nothing consumed —
-a busy spin that trips the task WDT (a real hazard, since `rnsd` floods every
-interface with the announce stream).
+- **net → rnsd: `pumpIn`.** Up to eight rounds: deliver the bytes held in
+  `rx_buf[rx_off..rx_fill)` through `hdlcConsume`; once they are all taken,
+  read the next `TCP_RX_CHUNK` (512 B) from `net_handle` into `rx_buf`, and
+  give the uplink a turn (`pumpOut`) after every chunk, so a fast inbound
+  stream never starves it. Bytes rnsd cannot take yet stay in `rx_buf`, and
+  the rest stays unread in the net stream, where TCP flow control backs the
+  sender off. The round cap returns control to `itsPoll`; unread net bytes
+  redispatch the callback.
+- **rnsd → net: `pumpOut`.** Takes queued rnsd packets only while the net
+  stream has room for a worst-case frame (`itsSpacesAvailable`), encodes them
+  back to back into one 2 KB batch and writes the batch in one `itsSend`, so a
+  write is never partial and the stream never carries a torn frame. What does
+  not fit stays queued in rnsd and sets `tx_blocked`. With no net side the
+  packets are drained and dropped.
+- **Retry.** Whatever is held arms a one-shot `itsSetFreeNotify`: a stalled
+  inbound frame on `rnsd_handle` for its length plus the 4-byte packet header,
+  `tx_blocked` on `net_handle` for one `HDLC_MAX_FRAME`. The far side freeing
+  that much room wakes `itsPoll`, and the loop runs `pumpIn` (which ends in
+  `pumpOut`) on each connection with `ioPending` (held `rx_buf` bytes or
+  `tx_blocked`). The only timed wake is a stalled frame's `RNSD_STALL_MAX`
+  running out (`ioDeadline`, folded into `nextDeadline`), so a full stream
+  neither polls nor keeps the chip out of light sleep.
+- **Teardown.** `resetIo` drops the held bytes, the partial frame and the
+  stall and block flags; an inbound slot is cleared whole when it is reused.
+
+The recv callbacks (`onNetRecv`, `onRnsdRecv` and their inbound twins) only
+find the connection and pump it. One with no connection behind it still calls
+`itsRecv` to drain and drop: returning without consuming would make ITS
+redispatch the callback forever — a busy spin that trips the task WDT (a real
+hazard, since `rnsd` floods every interface with the announce stream). A pump
+that leaves net bytes unread while rnsd is full is not that spin: ITS counts
+it as no progress and `itsPoll` blocks instead.
 
 `itsClientInit(TCP_MAX_PEERS * 2 + TCP_MAX_INBOUND)` reserves enough client-side
 slots for both directions of every outbound peer plus the inbound rnsd handles.
@@ -213,11 +242,23 @@ build without upnp has no row, while `loadServerConfig()` still reads the field
 
 `onInboundConnect` allocates the lowest free slot (refusing with `-1` when the
 server is disabled or at `s_maxInbound`), reads the client IP from the
-`net_connect_t` connect payload, and registers the interface with `rnsd` as
-`tcp_in/<addr>#<slot>` carrying the server mode + IFAC. **The slot index is both
-the serverRef handed to net and the ref handed to rnsd**, so either disconnect
-callback resolves the same slot. Traffic uses the same `hdlcConsume`/`hdlcSend`
-helpers as outbound.
+`net_connect_t` connect payload, and registers the interface with `rnsd`
+carrying the server mode + IFAC. **The slot index is both the serverRef handed
+to net and the ref handed to rnsd**, so either disconnect callback resolves the
+same slot. Traffic uses the same `pumpIn`/`pumpOut` as outbound.
+
+**Inbound names.** rnsd refuses a second interface of a name it holds
+(Transport keys interfaces on a hash of the name), and a name is at most 23
+characters (`rnsd_iface_t::name[24]`). So every accepted connection gets a name
+no live or just-closed one has: `tcp_in/<addr>#<n>` (`inboundName`), `n` a
+per-boot accept count modulo 100 that skips any name a live connection holds.
+A closed connection's name may stay registered with rnsd for a moment (its
+disconnect is asynchronous); the next accepts carry other counts, so a host
+that reconnects is never refused because of its old connection. The `#<n>` is
+never cut: an address too long for the name loses whole leading groups,
+marked `..` (`tcp_in/..168.178.156#42`). The full address is in the
+interface's `peer_label`. net's connect payload carries no client port, so
+the name has none.
 
 `reconcileServer()` runs on config change: it re-registers with net on first
 enable and on any later enable/disable or port change (so net opens, closes, or
