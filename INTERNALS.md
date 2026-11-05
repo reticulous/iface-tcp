@@ -11,8 +11,9 @@ existing ITS services ([spangap-net](../spangap-net) for TCP, [rns](../rns)'s
 
 - **One bridge task** (`tcpTaskMain`) that owns all peer and inbound state and
   runs both directions of traffic.
-- **HDLC byte-stuffing codec** (`hdlcSend` / `hdlcConsume`) framing RNS packets
-  on the TCP byte stream, wire-compatible with upstream Reticulum.
+- **HDLC byte-stuffing codec** (`tcp_hdlc.h`: `hdlcEncode`, `hdlcDecode`,
+  `hdlcPumpRx`) framing RNS packets on the TCP byte stream, wire-compatible
+  with upstream Reticulum.
 - **Outbound peer table** (`std::vector<peer_t> s_peers`) with a per-peer
   connect/backoff state machine, host:port-stable reconnect across config
   reloads, and the net-upstream dial gate.
@@ -79,17 +80,28 @@ decode:  scan for FLAG; inside a frame, ESC means XOR the next byte with 0x20
 length; `HDLC_MAX_FRAME` (`RNS_MTU * 2 + 4`, every byte escaped plus the two
 FLAGs) is the worst case. It does no I/O: `pumpOut` places the frames.
 
-`hdlcConsume<P>(p, in, n)` is a streaming decoder templated over `peer_t` and
-`inbound_peer_t` (which deliberately share the same HDLC and I/O field names).
-On each FLAG it sends a non-empty assembled frame to `p->rnsd_handle` as one
-ITS packet without waiting, then resets. When rnsd's link is full it stops at
-that closing FLAG and returns how many bytes it consumed, so the caller holds
-the rest; a frame still refused after `RNSD_STALL_MAX` (100 ms) is dropped and
-counted (`noteRnsdDrop`: the first drop of a run logs at once, the rest as one
-line per 5 s window). A frame exceeding `sizeof(rx_pkt)` (`RNS_MTU + 8`) aborts
-assembly with one `warn` and resyncs on the next FLAG. The bytes inside a frame
-are exactly the RNS packet that would go on any other interface — TCP adds only
+`hdlcDecode<P>(p, in, n, sink)` is a streaming decoder templated over `peer_t`
+and `inbound_peer_t` (which deliberately share the same HDLC and I/O field
+names); the escape state lives in the connection, so an ESC that ends one read
+applies to the first byte of the next. On each FLAG it offers a non-empty
+assembled frame to `sink.frame()`, then resets. tcp.cpp's sink (`RnsdSink`)
+sends it to `p->rnsd_handle` as one ITS packet without waiting; when rnsd's
+link is full it refuses, the decoder stops at that closing FLAG and returns
+how many bytes it consumed, and the caller holds the rest, so the same frame
+is offered again on resume. A frame still refused after `RNSD_STALL_MAX`
+(100 ms) is dropped and counted (`noteRnsdDrop`: the first drop of a run logs
+at once, the rest as one line per 5 s window). A frame exceeding
+`sizeof(rx_pkt)` (`RNS_MTU + 8`) aborts assembly with one `warn`
+(`sink.oversize()`) and resyncs on the next FLAG. The bytes inside a frame are
+exactly the RNS packet that would go on any other interface — TCP adds only
 delimitation.
+
+`tcp_hdlc.h` has no FreeRTOS or ITS in it, so the host test runs the
+firmware's own codec: `test/host/test_hdlc.sh` frames packets with RNS's
+`HDLC.escape` (the venv's RNS, `hdlc_vectors.py`), checks `hdlcEncode`
+byte for byte against it, and decodes through `hdlcPumpRx` with reads of
+1 byte, 512 B, random sizes, splits after every ESC and around every FLAG,
+each with no holds, random refusals and every frame refused once.
 
 ## 4. ITS topology
 
@@ -103,8 +115,8 @@ Each connection holds two ITS handles on the tcp task:
 Nothing on either path waits; every send is non-blocking and backpressure is
 held in state the task loop comes back for.
 
-- **net → rnsd: `pumpIn`.** Up to eight rounds: deliver the bytes held in
-  `rx_buf[rx_off..rx_fill)` through `hdlcConsume`; once they are all taken,
+- **net → rnsd: `pumpIn`** (`hdlcPumpRx`). Up to eight rounds: deliver the bytes held in
+  `rx_buf[rx_off..rx_fill)` through `hdlcDecode`; once they are all taken,
   read the next `TCP_RX_CHUNK` (512 B) from `net_handle` into `rx_buf`, and
   give the uplink a turn (`pumpOut`) after every chunk, so a fast inbound
   stream never starves it. Bytes rnsd cannot take yet stay in `rx_buf`, and

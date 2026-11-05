@@ -21,6 +21,7 @@
 #include "mem.h"
 #include "net.h"          /* netRegister, netIsUp, NET_EV_*, NET_PORT_TCP_DIAL */
 #include "ports.h"
+#include "tcp_hdlc.h"     /* hdlcEncode, hdlcDecode, hdlcPumpRx */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,12 +40,7 @@ static const char* TAG = "tcp";
 #define TCP_MAX_INBOUND 16       /* hard cap on concurrent inbound connections */
 #define TCP_MAX_SERVERS 4        /* incoming-port listeners (s.tcp.servers) */
 #define TCP_PORT_INBOUND 0x5443  /* ITS server port for accepted inbound conns */
-#define HDLC_FLAG      0x7E
-#define HDLC_ESC       0x7D
-#define HDLC_ESC_MASK  0x20
-#define RNS_MTU        500
 #define TCP_RX_CHUNK   512       /* net bytes read per itsRecv, held until delivered */
-#define HDLC_MAX_FRAME (RNS_MTU * 2 + 4)   /* every byte escaped + two FLAGs */
 
 enum peer_state_t : uint8_t {
     PS_IDLE = 0,
@@ -154,25 +150,7 @@ static bool s_globalEnable = true;
 static volatile bool s_upstreamUp = false;
 static volatile bool s_netEdge    = false;   /* upstream just came up — clear backoff, redial now */
 
-/* ─────────────── HDLC ─────────────── */
-
-/* HDLC-frame a packet into buf (HDLC_MAX_FRAME bytes); returns the frame length. */
-static size_t hdlcEncode(const uint8_t* data, size_t len, uint8_t* buf)
-{
-    size_t o = 0;
-    buf[o++] = HDLC_FLAG;
-    for (size_t i = 0; i < len && o < HDLC_MAX_FRAME - 2; i++) {
-        uint8_t b = data[i];
-        if (b == HDLC_FLAG || b == HDLC_ESC) {
-            buf[o++] = HDLC_ESC;
-            buf[o++] = (uint8_t)(b ^ HDLC_ESC_MASK);
-        } else {
-            buf[o++] = b;
-        }
-    }
-    buf[o++] = HDLC_FLAG;
-    return o;
-}
+/* ─────────────── HDLC pumps ─────────────── */
 
 /* Move every queued rnsd packet onto the net stream, framed and coalesced into
  * as few writes as the stream's free space allows. A packet is taken from rnsd
@@ -274,57 +252,29 @@ static void flushRnsdDrops(P* p, bool force = false)
  * stream backs up into TCP flow control; past this the frame is stale. */
 static const TickType_t RNSD_STALL_MAX = pdMS_TO_TICKS(100);
 
-/* Decode bytes from net into the peer's pkt buffer. On a complete frame,
- * forward to rnsd as one ITS packet and reset assembly state. Never waits:
- * when rnsd's link is full it stops at the closing FLAG and returns how many
- * bytes it consumed, so the caller holds the rest and retries. Templated so
- * both outbound peer_t and inbound_peer_t (identical HDLC fields) can use it. */
+/* hdlcDecode's sink for a connection: a complete frame goes to rnsd as one ITS
+ * packet. Never waits: when rnsd's link is full the frame is held (the decoder
+ * stops at its closing FLAG, the caller keeps the rest) until room returns or
+ * RNSD_STALL_MAX is up, then it is dropped. Templated so both outbound peer_t
+ * and inbound_peer_t (identical HDLC fields) can use it. */
 template<typename P>
-static size_t hdlcConsume(P* p, const uint8_t* in, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        uint8_t b = in[i];
-        if (b == HDLC_FLAG) {
-            if (p->rx_in_frame && p->rx_len > 0) {
-                /* End of frame — emit to rnsd. */
-                if (p->rnsd_handle >= 0 &&
-                    itsSend(p->rnsd_handle, p->rx_pkt, p->rx_len, 0) == 0) {
-                    TickType_t now = xTaskGetTickCount();
-                    if (!p->rx_stalled) { p->rx_stalled = true; p->rx_stall_since = now; }
-                    if (now - p->rx_stall_since < RNSD_STALL_MAX) {
-                        itsSetFreeNotify(p->rnsd_handle, p->rx_len + 4);   /* + packet header */
-                        return i;
-                    }
-                    noteRnsdDrop(p, p->rx_len);
-                }
-                p->rx_stalled = false;
+struct RnsdSink {
+    P* p;
+    bool frame(const uint8_t* pkt, size_t len) {
+        if (p->rnsd_handle >= 0 && itsSend(p->rnsd_handle, pkt, len, 0) == 0) {
+            TickType_t now = xTaskGetTickCount();
+            if (!p->rx_stalled) { p->rx_stalled = true; p->rx_stall_since = now; }
+            if (now - p->rx_stall_since < RNSD_STALL_MAX) {
+                itsSetFreeNotify(p->rnsd_handle, len + 4);   /* + packet header */
+                return false;
             }
-            p->rx_len = 0;
-            p->rx_in_frame = true;
-            p->rx_escaping = false;
-            continue;
+            noteRnsdDrop(p, len);
         }
-        if (!p->rx_in_frame) continue;
-        if (b == HDLC_ESC) {
-            p->rx_escaping = true;
-            continue;
-        }
-        if (p->rx_escaping) {
-            b ^= HDLC_ESC_MASK;
-            p->rx_escaping = false;
-        }
-        if (p->rx_len < sizeof(p->rx_pkt)) {
-            p->rx_pkt[p->rx_len++] = b;
-        } else {
-            /* Frame too big — abort assembly. */
-            p->rx_len = 0;
-            p->rx_in_frame = false;
-            p->rx_escaping = false;
-            warn("hdlc: frame > %d B, dropped", RNS_MTU);
-        }
+        p->rx_stalled = false;
+        return true;
     }
-    return n;
-}
+    void oversize() { warn("hdlc: frame > %d B, dropped", RNS_MTU); }
+};
 
 /* Serve one connection both ways: deliver held and fresh net bytes to rnsd a
  * chunk at a time, giving the uplink a turn after every chunk so a fast
@@ -336,19 +286,15 @@ static size_t hdlcConsume(P* p, const uint8_t* in, size_t n)
 template<typename P>
 static void pumpIn(P* p)
 {
-    for (int round = 0; round < 8; round++) {
-        if (p->rx_off < p->rx_fill) {
-            p->rx_off += hdlcConsume(p, p->rx_buf + p->rx_off, p->rx_fill - p->rx_off);
-            if (p->rx_off < p->rx_fill) break;
-        }
-        p->rx_off = p->rx_fill = 0;
-        if (p->net_handle < 0) break;
-        size_t n = itsRecv(p->net_handle, p->rx_buf, sizeof(p->rx_buf), 0);
-        if (n == 0) break;
-        p->bytes_in += n;
-        p->rx_fill = n;
-        pumpOut(p);
-    }
+    RnsdSink<P> sink{p};
+    hdlcPumpRx(p, sink,
+               [p](uint8_t* buf, size_t cap) -> size_t {
+                   if (p->net_handle < 0) return 0;
+                   size_t n = itsRecv(p->net_handle, buf, cap, 0);
+                   p->bytes_in += n;
+                   return n;
+               },
+               [p]() { pumpOut(p); });
     pumpOut(p);
 }
 
@@ -1359,7 +1305,7 @@ struct inbound_peer_t {
     char     addr[48];       /* client "ip" label */
     char     name[sizeof(rnsd_iface_t::name)];   /* registered rnsd iface name */
 
-    /* HDLC inbound assembly — same field names as peer_t so hdlcConsume<>
+    /* HDLC inbound assembly — same field names as peer_t so hdlcPumpRx<>
      * works on both. */
     uint8_t  rx_pkt[RNS_MTU + 8];
     size_t   rx_len;
